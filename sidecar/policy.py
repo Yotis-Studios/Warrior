@@ -80,11 +80,37 @@ class FirstLegalPolicy(Policy):
         return "end_turn", {}, None
 
 
+# DELIBERATELY GAME-AGNOSTIC. This describes the PROTOCOL -- how a turn is asked and answered --
+# and says nothing about any particular game. Whatever the model needs to know about the game it
+# is playing arrives in `state.briefing`, written by the game itself.
+#
+# The split matters. Rules in a sidecar's system prompt would be a second copy that nobody updates
+# when the game changes, and a sidecar is meant to be pointed at any game that speaks the
+# protocol. It is also the same principle the protocol is built on: the rulebook lives in exactly
+# one implementation, and that implementation is the engine.
 SYSTEM_PROMPT = (
-    "You are a competitive player taking your turn in a turn-based tactics game. "
-    "You are given the board, your situation, and the complete list of actions you are allowed "
-    "to take. Call the take_action tool exactly once, with an action_id copied exactly from that "
-    "list. You may not do anything that is not on the list."
+    "You are playing one seat in a turn-based game, against other players.\n"
+    "\n"
+    "Each time it is your turn you are given: a briefing on the game's rules, the current state "
+    "of the board as your seat can see it, and the COMPLETE list of actions you are allowed to "
+    "take right now.\n"
+    "\n"
+    "How to act:\n"
+    "- Call the take_action tool exactly once.\n"
+    "- action_id must be copied EXACTLY from the legal action list. Do not invent one, do not "
+    "adjust one, do not combine two.\n"
+    "- If what you want to do is not on the list, you may not do it this turn. The list is "
+    "complete; anything missing from it is forbidden rather than forgotten.\n"
+    "- Numbers you are given -- hit chances, distances, costs -- are computed by the game. Trust "
+    "them and do not recalculate them.\n"
+    "- You take ONE action at a time. After it resolves you will be asked again with an updated "
+    "board, so plan for the next action rather than the whole turn.\n"
+    "\n"
+    "You can only see what your seat is entitled to see. Other players' hidden information is "
+    "withheld deliberately -- reason about what they are likely to hold, and do not assume you "
+    "know it.\n"
+    "\n"
+    "Play to win."
 )
 
 
@@ -145,6 +171,11 @@ class LLMPolicy(Policy):
         fact about the game.
         """
         out = []
+        # The game's own rules briefing, FIRST, because everything below is meaningless without
+        # it. Supplied by the game rather than baked in here -- see SYSTEM_PROMPT.
+        if state.get("briefing"):
+            out.append(str(state["briefing"]))
+            out.append("")
         if state.get("turn") is not None:
             out.append(f"TURN {state['turn']}")
         board = state.get("board") or {}
