@@ -151,6 +151,36 @@ class LLMPolicy(Policy):
     def capabilities(self):
         return {"vision": self.vision, "chat": True, "commentary": True}
 
+    def loaded_model(self):
+        """What the inference server ACTUALLY has loaded, asked rather than remembered.
+
+        `--model` is a routing hint, and a hint is a copy: swap the model behind llama-server and
+        the flag keeps naming the old one, while inference quietly runs on the new. That is not a
+        cosmetic mislabel. The harness stamps this string into every result line and every trace,
+        so a run would carry the wrong provenance -- and provenance is not recoverable afterwards,
+        which is the entire reason it is recorded.
+
+        Caught in exactly that state: the sidecar reported Wichtel-Q4_K_M.gguf for a full session
+        after a Qwen3-VL-4B had replaced it behind the same port.
+
+        Falls back to the flag when the server will not say. Unreachable is not the same as
+        unknown, so the two are distinguishable rather than both becoming None.
+        """
+        try:
+            req = urllib.request.Request(self.url + "/v1/models")
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                d = json.loads(resp.read().decode("utf-8"))
+            entries = d.get("data") or d.get("models") or []
+            if entries:
+                name = entries[0].get("id") or entries[0].get("model") or entries[0].get("name")
+                if name:
+                    # llama-server reports the path it was launched with; the basename is what a
+                    # human recognises and what the old flag used to carry.
+                    return str(name).replace("\\", "/").rsplit("/", 1)[-1]
+        except Exception:                                       # noqa: BLE001
+            pass
+        return self.model or "<unknown>"
+
     # -- prompt construction -------------------------------------------------
 
     def _render_actions(self, actions):

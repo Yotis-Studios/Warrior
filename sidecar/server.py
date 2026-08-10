@@ -57,7 +57,10 @@ class Sidecar:
             "protocol_version": PROTOCOL_VERSION,
             "name": "warrior-reference",
             "policy": self.policy.name,
-            "model": getattr(self.policy, "model", None),
+            # ASKED, not remembered. The harness stamps this into every result line and trace, so
+            # a stale name here silently misattributes a whole run. See LLMPolicy.loaded_model.
+            "model": (self.policy.loaded_model() if hasattr(self.policy, "loaded_model")
+                      else getattr(self.policy, "model", None)),
             "capabilities": caps,
             "stats": {"acts": self.total_acts, "errors": self.total_errors,
                       "matches": len(self.matches)},
