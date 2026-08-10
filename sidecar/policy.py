@@ -333,6 +333,18 @@ class LLMPolicy(Policy):
         elif last and last.get("result"):
             user += f"\n\nYour previous action resolved: {last['result']}"
 
+        # A HINT, WHEN THE GAME SENT ONE. Placed last, right before the instruction to act, and
+        # attributed to the built-in AI rather than stated as fact -- the model should be able to
+        # disagree with it. Read from the request, not the state: a hint is about the decision,
+        # not about the board.
+        #
+        # The game records hint_level in its own stats line and in every dumped trace, because a
+        # hint contaminates the measurement it is mixed into and a run whose hint level is unknown
+        # cannot be compared to anything.
+        hint = (req.get("hint") or "").strip()
+        if hint:
+            user += "\n\nHINT: " + hint
+
         content = user + "\n\nTake one action now."
         shot = req.get("screenshot")
         if self.vision and shot and shot.get("b64"):
