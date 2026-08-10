@@ -110,6 +110,12 @@ SYSTEM_PROMPT = (
     "withheld deliberately -- reason about what they are likely to hold, and do not assume you "
     "know it.\n"
     "\n"
+    "You have a memory. take_action accepts an optional `why` -- one line on what you are "
+    "doing and why -- which you will see again on your next few actions, and an optional "
+    "`notes` field that replaces private notes carried for the rest of the match. Nothing "
+    "else remembers your intentions between actions, so a plan that takes more than one "
+    "action only survives if you write it down.\n"
+    "\n"
     "Play to win."
 )
 
@@ -218,6 +224,16 @@ class LLMPolicy(Policy):
             out.append("LEGEND: " + "; ".join("%s = %s" % (k, v)
                                               for k, v in board["legend"].items()))
 
+        notes = (state.get("your_notes") or "").strip()
+        if notes:
+            out.append("\nYOUR NOTES (written by you, only you can see them)")
+            out.append("  " + notes.replace("\n", "\n  "))
+        hist = state.get("your_recent_actions") or []
+        if hist:
+            out.append("\nYOUR LAST FEW ACTIONS")
+            for h in hist:
+                out.append("  - %s" % h)
+
         me = state.get("self") or {}
         if me:
             out.append("\nYOU: %s at %s" % (me.get("name", "?"), self._tile(me.get("tile"))))
@@ -309,6 +325,20 @@ class LLMPolicy(Policy):
                                   "description": "the action_id you choose"},
                     "message": {"type": "string",
                                 "description": "what to say -- only for a chat action"},
+                    # WORKING MEMORY, and it rides on the action rather than needing a tool of
+                    # its own. A separate update_notes tool would cost a whole extra round trip
+                    # per thought, at which point remembering something is more expensive than
+                    # doing something -- and the note is most accurate at the moment of decision
+                    # anyway.
+                    "why": {"type": "string",
+                            "description": "one short line on why you chose this, so you can "
+                                           "remember your intention on your next action"},
+                    "notes": {"type": "string",
+                              "description": "replace your private notes. They persist for the "
+                                             "rest of the match and only you can see them. Use "
+                                             "them for plans that take several actions, or "
+                                             "anything you want to remember about opponents. "
+                                             "Omit this to leave your notes unchanged."},
                 },
                 "required": ["action_id"],
             },
@@ -409,6 +439,11 @@ class LLMPolicy(Policy):
         out = {}
         if args.get("message"):
             out["message"] = args["message"]
+        # Passed through untouched. server.py forwards them to the game, which stores them
+        # verbatim -- the moment anything here edits them they stop being the model's memory.
+        for k in ("why", "notes"):
+            if args.get(k):
+                out[k] = args[k]
         return action_id, out, commentary
 
 
