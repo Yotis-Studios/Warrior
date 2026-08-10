@@ -299,3 +299,29 @@ stub for CI — but the reference implementation works like this, and the shape 
    *which model* is playing.
 6. **True headless.** Warriors connecting straight to a game server, with no client, would need the
    server to know the rules — which is exactly what §1.4 rules out. Deferred deliberately.
+
+7. **Annotated screenshots.** The `screenshot` field exists and is unused. The interesting version
+   is not a raw frame but one the game has **labelled** — capture points, your base, enemies, the
+   objects that block a shot — drawn on by the client, which already knows where all of them are.
+
+   The motivation is measured rather than speculative. A warrior given only coordinates moved on
+   **24%** of its decisions against the built-in AI's **46.7%**, and rushed on 0.3% against 9%.
+   Both are what "cannot tell which direction is forward" predicts: it is not choosing badly
+   between destinations, it is barely choosing destinations at all. Spatial relationships are
+   native to an image and have to be reconstructed from a coordinate list, and reconstruction is
+   the step that appears to be failing.
+
+   Three things would decide whether it works:
+
+   - **Labels must be the same identifiers the action list uses.** If the image says "Point A" and
+     the actions say `move_6_6`, the model has to bridge two namespaces and will do it wrong. Label
+     with coordinates, or carry the letter into the action note — but pick one vocabulary.
+   - **It shows more than a human sees**, which is a decision rather than an oversight. A player
+     does not have "3 tiles to Point A" floating over the board. The same call was already made for
+     `point.value`, and the honest framing is that a warrior with no vision is being compensated,
+     not privileged — but it should be deliberate and recorded, like `hint_level`.
+   - **Test whether the ASCII board is used at all first.** It is already in every prompt. If a
+     model ignores a grid it can read, an image it must interpret is unlikely to land — and that
+     experiment costs nothing, where rendering an annotated frame is real client work.
+
+   Out of scope for 0.1. The field is reserved so that adding it later is not a protocol change.
