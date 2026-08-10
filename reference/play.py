@@ -63,6 +63,13 @@ def run_match(game, seats, verbose=True, log=print):
             action_id, args = agent.choose(
                 game, f"{game.match_id}-t{game.turn}-s{seat}-a{step}", reason, last_action)
 
+            # None means the seat was never asked, because nothing was legal. Ending the turn is
+            # the only thing left, and it is the CLIENT ending it rather than the agent failing to.
+            if action_id is None:
+                if verbose:
+                    log("     (no legal action -- turn ends)")
+                break
+
             result, over = game.apply(action_id, args)
             if verbose:
                 extra = f"  \"{args['message']}\"" if args.get("message") else ""

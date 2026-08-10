@@ -117,6 +117,19 @@ class WarriorSeat:
         (and forgotten) at each call site.
         """
         actions = game.available_actions()
+
+        # DO NOT ASK WHEN THERE IS NOTHING TO CHOOSE. An empty legal set means the agent has no
+        # legal answer available, so whatever it replies is illegal by construction and the only
+        # outcome reachable is a forfeit -- which then pollutes the seat's stats with a failure
+        # that was the client's fault.
+        #
+        # Measured, not theorised: of the first twenty-five real Raifu Wars turns put in front of
+        # a model, six "failed", and all six were this. They were knocked-out seats, where a human
+        # could not have pressed anything either. The remaining nineteen were nineteen for
+        # nineteen.
+        if not actions:
+            return None, {}
+
         legal = {a["action_id"] for a in actions}
         state = game.redacted_state(self.seat)
 
@@ -212,6 +225,8 @@ class ScriptedSeat:
 
     def choose(self, game, request_id, reason, last_action):
         actions = game.available_actions()
+        if not actions:
+            return None, {}          # same rule as WarriorSeat -- see the note there
         self.stats.actions += 1
         if self.policy == "aggressive":
             for a in actions:

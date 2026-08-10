@@ -222,6 +222,22 @@ tokens; a naive full-history transcript would exceed a small model's context ins
 > samples returned an action that the enum excluded. Treat a returned `action_id` as untrusted
 > input from a program you did not write.
 
+### 6.0 Never ask with an empty legal set
+
+**A client MUST NOT send `/v1/act` when `available_actions` would be empty.** There is no legal
+answer, so every possible reply is illegal by construction and the only reachable outcome is a
+forfeit — recorded against a seat that did nothing wrong.
+
+This is not hypothetical. Of the first twenty-five real Raifu Wars turns replayed at a live model,
+six "failed" and **all six were this**: knocked-out seats, where the respawn roll is on a timer and
+a human could not have pressed anything either. The other nineteen were nineteen for nineteen.
+Sending them was the client's bug, and reading them as the model's failure would have been the
+wrong lesson entirely.
+
+If a seat has nothing to do, the client takes the turn forward itself.
+
+### 6.1 Validate every reply
+
 On receiving a response the client MUST:
 
 1. Reject any `action_id` not in the `available_actions` it just sent. Not "fuzzy match", not
