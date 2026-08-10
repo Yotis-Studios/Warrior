@@ -10,11 +10,13 @@ than aspirational.
 Built for [Raifu Wars](https://raifuwars.com) first, but nothing here is Raifu Wars specific — the
 game supplies state and a list of legal actions, the sidecar picks one.
 
-**Status: 0.1 draft.** The protocol is specified and the reference sidecar works end to end against
-a local model. The game-side client is not written yet.
+**Status: 0.1 draft.** The protocol is specified, and both halves have reference implementations
+that play complete matches against a local model. What is not written is the *game-side* client
+inside a real engine — Raifu Wars is next.
 
 - **[PROTOCOL.md](PROTOCOL.md)** — the wire contract
-- **`sidecar/`** — reference implementation, stdlib only
+- **`sidecar/`** — reference sidecar (the agent side), stdlib only
+- **`reference/`** — Skirmish, a small complete game implementing the **client** side
 - **`probe/`** — the experiments the design is based on
 - **`tests/`** — end-to-end smoke test
 
@@ -58,6 +60,37 @@ python tests/smoke.py --policy llm
 The random policy is not a toy. *"Do four seats of random legal actions finish a match"* is the
 cheapest regression gate a game engine can have — it needs no GPU, and it catches the failure that
 matters most: a state with no legal action out of it, which stalls a match forever.
+
+## Play a whole match
+
+`reference/` is **Skirmish** — a small, complete game that implements the *client* half. It exists
+because a protocol document cannot demonstrate that its contract is implementable, and because
+finding the design's mistakes in a real engine, in GML, tangled with a UI, would be the most
+expensive possible way to find them.
+
+Skirmish is deliberately not Raifu Wars: a protocol that only fits the game it was extracted from
+is not a protocol. It keeps what makes a game *hard to serve* — hidden information sitting in
+memory, a legal set whose shape changes after every action, dice so a turn cannot be planned up
+front, and targeted actions, which is where a model most wants to invent an identifier.
+
+```bash
+# Four scripted seats, no model. Finishes in well under a second -- this is the CI gate.
+python reference/play.py --seats 4 --scripted random
+
+# A warrior on seat 0 against three scripted opponents.
+python -m sidecar.server --policy llm --port 8879 &
+python reference/play.py --warrior 0=http://127.0.0.1:8879
+```
+
+A live 27B played **46 actions across 14 turns with zero rejections, zero retries and zero
+forfeits**, at 1.43s per action. It also lost to a random policy — which is worth stating plainly,
+because clean play and good play are different measurements and only the first one is proven here.
+
+`reference/client.py` is the part worth copying. Porting it is what seating a warrior means in any
+engine: enumerate completely, redact by whitelist, validate the reply as untrusted input, never
+stall. Its `SeatStats` deliberately separates *lost the match* from *never produced a legal
+action* — those look identical in a win column and mean opposite things, and a ladder that cannot
+tell them apart will rank a broken warrior as merely a bad one.
 
 ## What the probes found
 
@@ -115,6 +148,10 @@ PROTOCOL.md          the wire contract -- read this first
 sidecar/
   server.py          HTTP server implementing the protocol (stdlib only)
   policy.py          how a seat decides: random, first-legal, llm
+reference/
+  game.py            Skirmish: a small complete game (engine-side truth)
+  client.py          the CLIENT half of the protocol -- the part worth porting
+  play.py            run a full match; exit 1 if it did not finish
 probe/
   state_fixture.py   one realistic mid-match turn, shared by every experiment
   probe_action_format.py   named tools vs single-enum vs single-free
