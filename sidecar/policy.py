@@ -162,45 +162,134 @@ class LLMPolicy(Policy):
             lines.append(f"  {a['action_id']}: {label}{suffix}")
         return "\n".join(lines)
 
-    def _render_state(self, state):
-        """Text, not raw JSON.
+    @staticmethod
+    def _num(v):
+        """5.0 -> 5, 0.45 -> 0.45.
 
-        A model reads prose and a labelled board far better than it reads a nested object, and
-        the token cost is lower. Anything the client did not send simply does not appear -- this
-        deliberately never invents a default, because a fabricated zero reads to the model as a
-        fact about the game.
+        GML's json_stringify does not preserve the integer/real distinction, so EVERY number
+        arrives as a float: "TURN 5.0", "seat 1.0", "health 5.0", "need 25.0". That is noise on
+        every number in the payload, on every request, and it makes a board of small integers read
+        like sensor telemetry. Cosmetic, and cosmetics are most of what a prompt is.
         """
+        if isinstance(v, bool):
+            return "yes" if v else "no"
+        if isinstance(v, float) and v.is_integer():
+            return str(int(v))
+        return str(v)
+
+    @classmethod
+    def _tile(cls, t):
+        if isinstance(t, (list, tuple)) and len(t) >= 2:
+            return "(%s,%s)" % (cls._num(t[0]), cls._num(t[1]))
+        return str(t)
+
+    def _render_state(self, state):
+        """Text, in a FIXED ORDER, with no raw JSON.
+
+        Two things this gets right that dumping the structs did not.
+
+        ORDER IS FIXED HERE, because it is not fixed in the payload. GML struct key order is not
+        stable through json_stringify, so a dumped object put `is_fortified` first one turn and
+        `tile` first the next -- the model saw a differently-shaped description of the same
+        situation every turn, which is precisely the opposite of what helps it pattern-match.
+
+        AND IT IS PROSE. The board section was already laid out and reads well; the rest was
+        json.dumps of the same structs, which is denser, uglier and costs more tokens for less.
+        A model asked to weigh "should I close on that point" should not first have to parse
+        {"kills": 0.0, "stars": 2.0, "name": ...}.
+
+        Anything the client did not send simply does not appear. Deliberately never defaulted: a
+        fabricated zero reads to the model as a fact about the game.
+        """
+        n = self._num
         out = []
-        # The game's own rules briefing, FIRST, because everything below is meaningless without
-        # it. Supplied by the game rather than baked in here -- see SYSTEM_PROMPT.
+
         if state.get("briefing"):
             out.append(str(state["briefing"]))
             out.append("")
         if state.get("turn") is not None:
-            out.append(f"TURN {state['turn']}")
+            out.append("=== TURN %s ===" % n(state["turn"]))
+
         board = state.get("board") or {}
         if board.get("ascii"):
-            out.append("\nBOARD:\n" + board["ascii"])
+            out.append("\nBOARD")
+            out.append(board["ascii"])
         if board.get("legend"):
-            out.append("LEGEND: " + "; ".join(f"{k} = {v}" for k, v in board["legend"].items()))
-        if state.get("self"):
-            out.append("\nYOU: " + json.dumps(state["self"], separators=(", ", ": ")))
-        if state.get("players"):
-            out.append("\nPLAYERS:")
-            for p in state["players"]:
-                out.append("  " + json.dumps(p, separators=(", ", ": ")))
-        if board.get("points"):
-            out.append("\nCAPTURE POINTS:")
-            for pt in board["points"]:
-                out.append("  " + json.dumps(pt, separators=(", ", ": ")))
-        if state.get("events_since_last_turn"):
-            out.append("\nSINCE YOUR LAST TURN:")
-            for e in state["events_since_last_turn"]:
-                out.append(f"  - {e}")
-        if state.get("chat"):
-            out.append("\nTABLE CHAT:")
-            for c in state["chat"]:
-                out.append(f"  seat {c.get('seat')}: {c.get('text')}")
+            out.append("LEGEND: " + "; ".join("%s = %s" % (k, v)
+                                              for k, v in board["legend"].items()))
+
+        me = state.get("self") or {}
+        if me:
+            out.append("\nYOU: %s at %s" % (me.get("name", "?"), self._tile(me.get("tile"))))
+            out.append("  health %s/%s   ammo %s/%s   range %s%s"
+                       % (n(me.get("health")), n(me.get("max_health")),
+                          n(me.get("ammo")), n(me.get("max_ammo")), n(me.get("range")),
+                          "   FORTIFIED" if me.get("is_fortified") else ""))
+            out.append("  %s stars, tier %s, %s kills, %s deaths"
+                       % (n(me.get("stars")), n(me.get("tier")),
+                          n(me.get("kills")), n(me.get("deaths"))))
+            tp = me.get("tier_progress") or {}
+            if tp:
+                out.append("  TIER PROGRESS: %s of %s %s needed to reach tier %s"
+                           % (n(tp.get("have")), n(tp.get("need")),
+                              tp.get("condition"), n(tp.get("next_tier"))))
+            if me.get("in_friendly_territory") is not None:
+                out.append("  standing in friendly territory: %s"
+                           % n(me.get("in_friendly_territory")))
+            tt = me.get("this_turn") or {}
+            if tt:
+                # Named in the order a turn actually happens, not whatever order the struct
+                # arrived in -- moved, then the combat action, then the once-per-turn extras.
+                order = ["moved", "attacked", "rushed", "played_card", "tiered"]
+                spent = [k for k in order if tt.get(k)]
+                out.append("  ALREADY DONE THIS TURN: %s"
+                           % (", ".join(spent) if spent else "nothing yet"))
+            hand = me.get("hand") or []
+            if hand:
+                out.append("  YOUR HAND:")
+                for c in hand:
+                    out.append("    %s (%s stars, needs tier %s) -- %s"
+                               % (c.get("name"), n(c.get("cost_stars")),
+                                  n(c.get("tier_required")), c.get("text", "")))
+            else:
+                out.append("  YOUR HAND: empty")
+
+        others = [p for p in (state.get("players") or []) if not p.get("is_self")]
+        if others:
+            out.append("\nOTHER PLAYERS")
+            for p in others:
+                out.append("  %s at %s -- %s health, tier %s, %s stars, %s kills, "
+                           "%s cards in hand%s%s"
+                           % (p.get("name"), self._tile(p.get("tile")), n(p.get("health")),
+                              n(p.get("tier")), n(p.get("stars")), n(p.get("kills")),
+                              n(p.get("cards_in_hand")),
+                              ", FORTIFIED" if p.get("is_fortified") else "",
+                              "" if p.get("status") == "alive" else ", %s" % p.get("status")))
+            out.append("  (you cannot see which cards they hold, only how many)")
+
+        points = board.get("points") or []
+        if points:
+            out.append("\nCAPTURE POINTS")
+            for pt in points:
+                who = pt.get("relationship", "?")
+                held = pt.get("held_by_seat")
+                if held is not None and n(held) != "-1":
+                    who += " (seat %s)" % n(held)
+                out.append("  %s -- %s%s" % (self._tile(pt.get("tile")), who,
+                                             "  [a start base]" if pt.get("is_base") else ""))
+
+        ev = state.get("events_since_last_turn") or []
+        if ev:
+            out.append("\nSINCE YOUR LAST TURN")
+            for e in ev:
+                out.append("  - %s" % e)
+
+        chat = state.get("chat") or []
+        if chat:
+            out.append("\nTABLE CHAT")
+            for c in chat:
+                out.append("  seat %s: %s" % (n(c.get("seat")), c.get("text")))
+
         return "\n".join(out)
 
     def _tools(self, actions):
