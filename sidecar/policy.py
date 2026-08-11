@@ -141,6 +141,9 @@ class LLMPolicy(Policy):
         # From the environment by default, so a key never has to appear in a command line, a shell
         # history or a process list. warrior-tournament.sh echoes its own invocation.
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY") or ""
+        # Set once a provider has rejected tool_choice="required", so the downgrade is paid for
+        # exactly one round trip rather than on every turn of a forty-match tournament.
+        self._tool_choice_downgraded = False
         self.temperature = temperature
         # GENEROUS ON PURPOSE. At 900 this model returned no tool call at all in half of samples
         # -- it was still reasoning when the cap hit, and a truncated reply is indistinguishable
@@ -475,6 +478,19 @@ class LLMPolicy(Policy):
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     return json.loads(resp.read())
             except urllib.error.HTTPError as exc:
+                if exc.code == 400 and not self._tool_choice_downgraded:
+                    peek = exc.read().decode("utf-8", "replace")
+                    if "tool_choice" in peek:
+                        # See eval_sft.py: some providers reject "required" outright. Downgrade
+                        # once, remember it for the rest of the process so every later turn does
+                        # not pay a wasted round trip, and say so -- a run served under a weaker
+                        # constraint than the one requested is a fact about the run.
+                        self._tool_choice_downgraded = True
+                        body["tool_choice"] = "auto"
+                        print("[warrior] provider refused tool_choice=required; using auto",
+                              flush=True)
+                        continue
+                    raise RuntimeError("HTTP 400 from %s: %s" % (self.url, peek[:300]))
                 if exc.code not in (408, 429, 500, 502, 503, 504) or attempt == 2:
                     # The body carries the provider's actual complaint -- "no endpoints found for
                     # model", "tool use not supported" -- and losing it turns a five-second fix

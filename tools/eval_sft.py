@@ -67,7 +67,30 @@ def ask(url, model, messages, tools, timeout, api_key=None):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             d = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        return None, "http %s: %s" % (exc.code, exc.read().decode("utf-8", "replace")[:200])
+        detail = exc.read().decode("utf-8", "replace")
+        # NOT EVERY PROVIDER SUPPORTS tool_choice="required". Measured on OpenRouter:
+        # qwen3.7-flash's provider answers 400 `The tool_choice parameter does not support
+        # "required"` to every request -- which, without a fallback, reads as a model scoring zero
+        # rather than an API that refused to be asked.
+        #
+        # "auto" is weaker: the model MAY answer in prose instead of calling the tool. But a weaker
+        # constraint that runs beats a stronger one that 400s, and the caller already reports a
+        # missing tool call as its own number.
+        #
+        # Retried once, on that specific complaint only. A blanket downgrade would silently weaken
+        # the constraint for every provider that does honour it.
+        if exc.code == 400 and "tool_choice" in detail:
+            body["tool_choice"] = "auto"
+            req2 = urllib.request.Request(url.rstrip("/") + "/v1/chat/completions",
+                                          data=json.dumps(body).encode("utf-8"),
+                                          headers=headers)
+            try:
+                with urllib.request.urlopen(req2, timeout=timeout) as resp:
+                    d = json.loads(resp.read().decode("utf-8"))
+            except Exception as exc2:                           # noqa: BLE001
+                return None, "http %s then auto failed: %s" % (exc.code, exc2)
+        else:
+            return None, "http %s: %s" % (exc.code, detail[:200])
     except Exception as exc:                                    # noqa: BLE001
         return None, "transport: %s" % exc
 
