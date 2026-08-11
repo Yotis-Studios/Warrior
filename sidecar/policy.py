@@ -10,6 +10,7 @@ that matters most: a match that stalls forever because some state has no legal a
 """
 
 import json
+import os
 import random
 import time
 import urllib.error
@@ -133,9 +134,13 @@ class LLMPolicy(Policy):
     name = "llm"
 
     def __init__(self, url="http://127.0.0.1:8080", model=None, temperature=0.7,
-                 max_tokens=2500, thinking=False, timeout=120.0, vision=False):
+                 max_tokens=2500, thinking=False, timeout=120.0, vision=False,
+                 api_key=None):
         self.url = url.rstrip("/")
         self.model = model
+        # From the environment by default, so a key never has to appear in a command line, a shell
+        # history or a process list. warrior-tournament.sh echoes its own invocation.
+        self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY") or ""
         self.temperature = temperature
         # GENEROUS ON PURPOSE. At 900 this model returned no tool call at all in half of samples
         # -- it was still reasoning when the cap hit, and a truncated reply is indistinguishable
@@ -166,8 +171,15 @@ class LLMPolicy(Policy):
         Falls back to the flag when the server will not say. Unreachable is not the same as
         unknown, so the two are distinguishable rather than both becoming None.
         """
+        # AN EXPLICIT --model WINS. Asking the endpoint is the right move for a server hosting one
+        # model, where the flag can silently go stale. It is the wrong move for a hosted gateway:
+        # OpenRouter's /v1/models lists hundreds, and picking the first would report a model the
+        # run never touched -- a worse failure than the staleness this was written to prevent,
+        # because it looks authoritative.
+        if self.model:
+            return self.model
         try:
-            req = urllib.request.Request(self.url + "/v1/models")
+            req = urllib.request.Request(self.url + "/v1/models", headers=self._headers())
             with urllib.request.urlopen(req, timeout=5.0) as resp:
                 d = json.loads(resp.read().decode("utf-8"))
             entries = d.get("data") or d.get("models") or []
@@ -434,14 +446,44 @@ class LLMPolicy(Policy):
         payload = self._post(body)
         return self._parse(payload, actions)
 
+    def _headers(self):
+        h = {"Content-Type": "application/json"}
+        if self.api_key:
+            h["Authorization"] = "Bearer " + self.api_key
+            # OpenRouter attributes requests by these and shows them on the account's activity
+            # page. Harmless anywhere else -- a local llama-server ignores unknown headers.
+            h["HTTP-Referer"] = "https://github.com/yotisstudios/Warrior"
+            h["X-Title"] = "Warrior protocol"
+        return h
+
     def _post(self, body):
-        req = urllib.request.Request(
-            self.url + "/v1/chat/completions",
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            return json.loads(resp.read())
+        # RETRIED ON RATE LIMIT AND ON A GATEWAY HICCUP, which a local server never needed. A
+        # hosted endpoint answers 429 under load and 502/503 when a provider behind it drops, and
+        # the game's deadline is 30 seconds -- so a single unlucky request would otherwise be
+        # scored as the model failing to answer. Bounded and short: three tries, and the backoff
+        # has to fit inside the deadline or retrying is just a slower way to miss it.
+        #
+        # Nothing else is retried. A 400 is a malformed request and will be malformed next time.
+        last = None
+        for attempt in range(3):
+            req = urllib.request.Request(
+                self.url + "/v1/chat/completions",
+                data=json.dumps(body).encode(),
+                headers=self._headers(),
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    return json.loads(resp.read())
+            except urllib.error.HTTPError as exc:
+                if exc.code not in (408, 429, 500, 502, 503, 504) or attempt == 2:
+                    # The body carries the provider's actual complaint -- "no endpoints found for
+                    # model", "tool use not supported" -- and losing it turns a five-second fix
+                    # into a debugging session.
+                    detail = exc.read().decode("utf-8", "replace")[:300]
+                    raise RuntimeError("HTTP %s from %s: %s" % (exc.code, self.url, detail))
+                last = exc
+                time.sleep(0.6 * (attempt + 1))
+        raise RuntimeError("giving up after retries: %s" % last)
 
     def _parse(self, payload, actions):
         choice = (payload.get("choices") or [{}])[0]
@@ -494,5 +536,6 @@ def build_policy(kind, **kw):
             max_tokens=kw.get("max_tokens", 2500),
             thinking=kw.get("thinking", False),
             vision=kw.get("vision", False),
+            api_key=kw.get("api_key"),
         )
     raise ValueError(f"unknown policy {kind!r}")

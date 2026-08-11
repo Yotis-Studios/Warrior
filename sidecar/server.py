@@ -14,6 +14,7 @@ per second at model latency.
 import argparse
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -215,6 +216,12 @@ def main(argv=None):
     ap.add_argument("--vision", action="store_true",
                     help="accept screenshots and forward them to the model")
     ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--api-key", default=None,
+                    help="bearer token for a hosted endpoint. Defaults to $OPENROUTER_API_KEY; "
+                         "prefer the environment so the key stays out of your shell history")
+    ap.add_argument("--openrouter", metavar="MODEL",
+                    help="shorthand for --url https://openrouter.ai/api --model MODEL, e.g. "
+                         "--openrouter anthropic/claude-3.5-sonnet")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -222,9 +229,24 @@ def main(argv=None):
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S")
 
+    if args.openrouter:
+        args.url = "https://openrouter.ai/api"
+        args.model = args.openrouter
+        args.policy = "llm"
+
+    # FAIL HERE, NOT ON THE FIRST TURN OF A TOURNAMENT. A hosted endpoint without a key answers
+    # 401 on every request, and the game reads that as the seat failing to decide -- forty matches
+    # of forfeits that look like a model being bad at the game.
+    key = args.api_key or os.environ.get("OPENROUTER_API_KEY")
+    if args.policy == "llm" and args.url.startswith("https://") and not key:
+        ap.error("a hosted endpoint needs a key: pass --api-key or set OPENROUTER_API_KEY")
+    if args.policy == "llm" and args.url.startswith("https://") and not args.model:
+        ap.error("a hosted endpoint needs an explicit --model (or --openrouter MODEL)")
+
     policy = build_policy(
         args.policy, url=args.url, model=args.model, temperature=args.temperature,
-        max_tokens=args.max_tokens, thinking=args.thinking, vision=args.vision, seed=args.seed)
+        max_tokens=args.max_tokens, thinking=args.thinking, vision=args.vision, seed=args.seed,
+        api_key=args.api_key)
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.sidecar = Sidecar(policy)
