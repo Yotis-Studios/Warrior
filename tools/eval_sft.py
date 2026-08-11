@@ -30,6 +30,7 @@ collapses to -- a model that scores 35% has learned nothing if `move` is 35% of 
 import argparse
 import collections
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -43,7 +44,7 @@ def family(a):
     return a
 
 
-def ask(url, model, messages, tools, timeout):
+def ask(url, model, messages, tools, timeout, api_key=None):
     body = {
         "messages": messages,
         "tools": tools,
@@ -54,14 +55,21 @@ def ask(url, model, messages, tools, timeout):
     }
     if model:
         body["model"] = model
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
+        headers["HTTP-Referer"] = "https://github.com/yotisstudios/Warrior"
+        headers["X-Title"] = "Warrior protocol"
     req = urllib.request.Request(url.rstrip("/") + "/v1/chat/completions",
                                  data=json.dumps(body).encode("utf-8"),
-                                 headers={"Content-Type": "application/json"})
+                                 headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             d = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return None, "http %s: %s" % (exc.code, exc.read().decode("utf-8", "replace")[:200])
     except Exception as exc:                                    # noqa: BLE001
-        return None, "error: %s" % exc
+        return None, "transport: %s" % exc
 
     msg = (d.get("choices") or [{}])[0].get("message") or {}
     calls = msg.get("tool_calls") or []
@@ -82,7 +90,10 @@ def main():
     ap.add_argument("--model", default=None)
     ap.add_argument("--n", type=int, default=0, help="cap rows (0 = all)")
     ap.add_argument("--timeout", type=float, default=180.0)
+    ap.add_argument("--api-key", default=None,
+                    help="bearer token; defaults to $OPENROUTER_API_KEY")
     args = ap.parse_args()
+    api_key = args.api_key or os.environ.get("OPENROUTER_API_KEY")
 
     rows = []
     with open(args.val, encoding="utf-8", errors="replace") as fh:
@@ -97,6 +108,8 @@ def main():
         return 1
 
     hit = illegal = nocall = 0
+    failed = 0                 # request never reached a model: HTTP or transport
+    fail_examples = []
     per_fam = collections.Counter()
     per_fam_hit = collections.Counter()
     target_fams = collections.Counter()
@@ -107,13 +120,21 @@ def main():
         target = json.loads(msgs[2]["tool_calls"][0]["function"]["arguments"])["action_id"]
         legal = set(row["tools"][0]["function"]["parameters"]["properties"]["action_id"]["enum"])
         # Only the system and user turns -- the assistant turn IS the answer.
-        pred, err = ask(args.url, args.model, msgs[:2], row["tools"], args.timeout)
+        pred, err = ask(args.url, args.model, msgs[:2], row["tools"], args.timeout, api_key)
 
         tf = family(target)
         target_fams[tf] += 1
         per_fam[tf] += 1
         if pred is None:
-            nocall += 1
+            # SPLIT, because they have opposite causes. "no tool call" is a fact about the model;
+            # an HTTP or transport error means the question never arrived, and averaging the two
+            # into one column is how a wrong URL gets reported as a model limitation.
+            if err and not err.startswith("no tool call"):
+                failed += 1
+                if len(fail_examples) < 3:
+                    fail_examples.append(err)
+            else:
+                nocall += 1
         else:
             predicted_fams[family(pred)] += 1
             if pred not in legal:
@@ -134,7 +155,16 @@ def main():
           % (most_common_fam, 100.0 * mc / n))
     print("  illegal answers : %5.1f%%  (%d)  -- action_id not in the offered set"
           % (100.0 * illegal / n, illegal))
-    print("  no tool call    : %5.1f%%  (%d)" % (100.0 * nocall / n, nocall))
+    print("  no tool call    : %5.1f%%  (%d)  -- model answered without calling the tool"
+          % (100.0 * nocall / n, nocall))
+    print("  request FAILED  : %5.1f%%  (%d)  -- never reached a model (HTTP/transport)"
+          % (100.0 * failed / n, failed))
+    for e in fail_examples:
+        print("      %s" % e)
+    if failed:
+        print("\n  REQUESTS FAILED. This is not a result about the model -- check the URL is a raw")
+        print("  OpenAI-compatible endpoint (NOT the sidecar, which serves /v1/act), the model id")
+        print("  exists, and the key is set.")
 
     print("\n  %-14s %8s %8s %7s" % ("target family", "count", "hit", "rate"))
     for f, c in target_fams.most_common():
