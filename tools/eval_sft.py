@@ -115,8 +115,32 @@ def main():
     ap.add_argument("--timeout", type=float, default=180.0)
     ap.add_argument("--api-key", default=None,
                     help="bearer token; defaults to $OPENROUTER_API_KEY")
+    ap.add_argument("--fewshot", type=int, default=0, metavar="N",
+                    help="prepend N worked examples as message turns, taken from train.jsonl "
+                         "beside the val file (never from val -- that would leak the answers)")
     args = ap.parse_args()
     api_key = args.api_key or os.environ.get("OPENROUTER_API_KEY")
+
+    shots = []
+    if args.fewshot:
+        train = os.path.join(os.path.dirname(os.path.abspath(args.val)), "train.jsonl")
+        if not os.path.isfile(train):
+            print("--fewshot needs train.jsonl beside %s" % args.val)
+            return 1
+        with open(train, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                d = json.loads(line)
+                m = d["messages"]
+                # The user turn and the assistant's tool call, verbatim. The system turn is not
+                # repeated -- it is already the first message and saying it twice teaches nothing.
+                shots.append(m[1])
+                shots.append(m[2])
+                if len(shots) >= args.fewshot * 2:
+                    break
+        print("  few-shot: %d worked examples from train.jsonl" % (len(shots) // 2))
 
     rows = []
     with open(args.val, encoding="utf-8", errors="replace") as fh:
@@ -143,7 +167,9 @@ def main():
         target = json.loads(msgs[2]["tool_calls"][0]["function"]["arguments"])["action_id"]
         legal = set(row["tools"][0]["function"]["parameters"]["properties"]["action_id"]["enum"])
         # Only the system and user turns -- the assistant turn IS the answer.
-        pred, err = ask(args.url, args.model, msgs[:2], row["tools"], args.timeout, api_key)
+        # system, then the worked examples, then the real question.
+        convo = [msgs[0]] + shots + [msgs[1]]
+        pred, err = ask(args.url, args.model, convo, row["tools"], args.timeout, api_key)
 
         tf = family(target)
         target_fams[tf] += 1
