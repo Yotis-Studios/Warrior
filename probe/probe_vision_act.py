@@ -120,6 +120,7 @@ def main():
     print("  states  : %d real decisions from %s\n" % (len(states), os.path.basename(args.trace)))
 
     same = 0
+    nondet = 0   # states where two IDENTICAL blind requests disagreed -- this probe's power
     errors = 0
     for i, st in enumerate(states):
         ids = [a.get("action_id") for a in st["available_actions"]]
@@ -138,7 +139,20 @@ def main():
         seen = dict(base_req, request_id="probe-%d-seen" % i,
                     screenshot={"b64": b64, "mime": mime})
 
+        # THE CONTROL, AND WITHOUT IT THIS TOOL LIES. Its first version compared blind against
+        # sighted, got 10/10 identical, and printed "the image changed nothing". That conclusion
+        # was unsupported: the model is DETERMINISTIC on these payloads, so two identical requests
+        # also return identical answers 10 times out of 10. A test whose null and its finding look
+        # the same has no power, and this one was one sentence from being read as "vision does not
+        # help" -- which would have killed the annotated-renderer work on no evidence.
+        #
+        # So every state is also sent blind TWICE. If those disagree, the comparison below means
+        # something; if they always agree, it means nothing and the report says so.
+        ctrl = dict(base_req, request_id="probe-%d-ctrl" % i)
+        rc = post(args.url, ctrl)
         rb, rs = post(args.url, blind), post(args.url, seen)
+        if rb.get("action_id") != rc.get("action_id"):
+            nondet += 1
         ab = rb.get("action_id", "ERR:" + str(rb.get("error"))[:40])
         as_ = rs.get("action_id", "ERR:" + str(rs.get("error"))[:40])
         if str(ab).startswith("ERR") or str(as_).startswith("ERR"):
@@ -152,10 +166,24 @@ def main():
     n = len(states)
     print("\n  identical with and without the image: %d / %d (%.0f%%)"
           % (same, n, 100.0 * same / n))
+    print("  control -- two IDENTICAL blind requests disagreed on %d / %d states" % (nondet, n))
     print("  errors: %d" % errors)
+
+    # POWER FIRST, FINDING SECOND. Printing the comparison without the control is how a result
+    # that means nothing gets read as a null -- which is exactly what this tool did on its first
+    # run, reporting "the image changed nothing" against a model that answers identically to
+    # identical payloads.
+    if nondet == 0:
+        print("\n  NO POWER. The model answers identically to identical payloads, so identical")
+        print("  answers across different payloads say nothing about the image. This run CANNOT")
+        print("  distinguish 'vision is ignored' from 'vision is working'. Use a vision-dependent")
+        print("  question, or raise temperature and sample repeatedly.")
+        print("  To check the image reaches the model at all, compare prompt_tokens with and")
+        print("  without it: a VL model encodes an image as hundreds of extra tokens.")
+        return 2
     if same == n:
-        print("\n  The image changed nothing. Either it is not reaching the model, or it is being")
-        print("  ignored -- and a vision tournament would be a text tournament wearing a label.")
+        print("\n  The image changed nothing, and the control shows this test COULD have seen a")
+        print("  difference. That is a real null: the image arrives and is ignored.")
     return 0
 
 
