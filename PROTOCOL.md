@@ -199,6 +199,44 @@ that is per game — but it fixes the shape:
 }
 ```
 
+### 5.1 Say what the rules use, not what the HUD shows
+
+Three fields were added after a referee (`check-rules.py`) compared offers against the state they
+were made in and found the payload naming a quantity the rules do not use:
+
+| field | why it exists |
+|---|---|
+| `self.move_budget` | `move_roll` is the **die**. The budget is the roll plus a character modifier, forced to 1 by one card and raised by another. On 25% of decisions they differ, so an agent computing its own reachable set from the roll computed the wrong one. |
+| `board.points[].radius` | A point covers a **square**, not a tile. The same number was already being sent as `stars_per_turn`, so one field carried two unrelated meanings and the payload named only the one that decides nothing. Tiering is legal anywhere inside your base's square — a fact no agent could read. |
+| `self.abilities` | The numbers say `range: 20`. Only this says that 20 is *+2 over everyone else*. A character is drawn per match and its modifiers are the largest single difference between two seats. |
+
+The rule they share: **if the engine derives a quantity before applying a rule, send the derived
+one.** Sending the base and expecting the agent to re-derive it means shipping a second copy of the
+rule in every client that talks to you, and that copy is never updated when yours changes.
+
+`self.school` and `self.doctrine` are flavour, not mechanics — they are what the seat is *like*
+rather than what it can do, and they exist so a persona has something to work with.
+
+### 5.2 `chat` is two-way, and the spec had only ever been half-built
+
+This document specified `state.chat` from the beginning and the game never populated it. The
+sidecar had a renderer for it, so a warrior could **talk and could never listen** — for the whole
+life of the protocol, with nothing failing. A field-variation checker even reported `chat` as never
+varying and it was dismissed as "only present online". It was absent online too.
+
+Both halves are now real:
+
+- **Reading.** `state.chat` carries the last few lines as `{seat, text}`. `seat` is `-1` for system
+  lines (the kill feed, the card feed), so it joins onto the roster the agent already has. Only the
+  last few: an unbounded log grows without limit across a long match and pushes the board out of
+  the model's attention, and what matters for a reply is what was just said.
+- **Writing.** A `chat` action with `args.message`. It does **not** consume the turn — the agent is
+  asked to act again immediately — which is the property that makes talking affordable at all.
+
+If a game localises its strings, whatever the agent reads should be generated in ONE language
+regardless of the client's locale. Otherwise the machine's locale silently decides what language a
+corpus is collected in, and any dataset built from it inherits that permanently.
+
 Two rules carry the weight:
 
 **Redaction is a whitelist.** The client builds `state` by naming what goes in, never by copying
@@ -276,11 +314,58 @@ non-trivial is a warrior that is not really playing.
 Not part of the wire contract — a sidecar may be a language model, a scripted policy, or a random
 stub for CI — but the reference implementation works like this, and the shape is what §0 measured:
 
-- One tool, `take_action(action_id, message?)`, `tool_choice: "required"`.
+- One tool, `take_action(action_id, message?, why?, notes?)`, `tool_choice: "required"`.
 - `action_id` carries an `enum` of the legal set. Belt and braces only; §6 still applies.
 - The board, the legal actions and their annotations go in the user message as text.
 - `reasoning_content`, when a model emits it, is returned as `commentary` for spectator overlays.
   It is never parsed for meaning.
+
+### 8.1 A second tool: consulting an expert
+
+**Not protocol.** The game knows nothing about this; it is entirely between a sidecar and its
+model. It is documented here because it changes what the sidecar is for.
+
+A sidecar may hold a second policy — in the reference implementation an RL action-scorer that wins
+~55% of its matches against the game's built-in AI, where that AI wins ~28% of its own — and offer
+it to the model as `consult_expert()`. The model asks, reads, and then still calls `take_action`.
+
+The obvious composition is a **router**: let the strong policy take the actions and the model do
+the talking. That throws away the interesting half. What each side has is genuinely different:
+
+| the expert has | the model has |
+|---|---|
+| a calibrated distribution over the legal set | a plan that survives across turns |
+| a value estimate for the position | the ability to read card text |
+| ~55% against the built-in AI | the table — what other players just said |
+| no memory, no plan, and no words | judgement about when the above matters |
+
+So it returns a **distribution and a position value**, not an order:
+
+```
+move_4_2   Move to (4,2)   99% of its confidence
+It rates your POSITION at 14.3 (a winning position scores about 17, a losing one about 4).
+It is confident. Disagreeing is a real decision, not a coin flip.
+```
+
+Confidence is the part that makes it useful. A 70/30 split is information the model never had —
+previously it chose among forty ids with no sense of which two were even in contention — and a 30%
+action is a defensible choice when the model knows something the expert cannot see. A teammate
+saying "cover the left" is exactly that: the expert has no channel for it, no notion of an ally,
+and no memory of the request. Overriding for that reason is not second-guessing a stronger player.
+
+Two things follow for anyone building this:
+
+- **The consult must be free.** It costs a round trip and no turn, which is only affordable because
+  the game has no per-action clock (§2). Bound it — two consults per decision — because a model
+  that keeps asking instead of acting is stuck and the game is holding its turn open meanwhile.
+- **Record whether it listened.** "The model consults an expert" is worth nothing on its own. The
+  measurable quantities are how often it asks, how often it follows *when the expert is confident*,
+  and whether the matches it overrode in went better or worse. The control is the expert playing
+  alone: a model on top of a 55% policy must beat 55%, and one that overrides good advice will
+  score below the expert it is holding.
+
+A persona, if a sidecar offers one, belongs after the rules and scoped to presentation. A model
+told to be in character still may not invent an `action_id`.
 
 ---
 
@@ -289,7 +374,8 @@ stub for CI — but the reference implementation works like this, and the shape 
 1. **Multi-character seats.** Split control (one seat, several characters) needs `character_id` on
    actions, and an ordering rule: fixed or freely interleaved.
 2. **Team chat.** Public-only makes deception harder and funnier; private channels enable real
-   coordination. It changes what a ladder measures.
+   coordination. It changes what a ladder measures. Public chat is implemented (§5.2); private is
+   not, and that is a design choice rather than a technical gap.
 3. **Disconnect and reconnect.** Grace period, hand off to the built-in AI, or forfeit.
 4. **Replay format.** A seed plus an action log should reproduce a match exactly — worth confirming
    before relying on it, given dice may come from a server.

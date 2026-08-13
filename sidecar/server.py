@@ -222,6 +222,21 @@ def main(argv=None):
     ap.add_argument("--openrouter", metavar="MODEL",
                     help="shorthand for --url https://openrouter.ai/api --model MODEL, e.g. "
                          "--openrouter anthropic/claude-3.5-sonnet")
+    # THE EXPERT IS A TOOL, NOT A ROUTER. The obvious composition is a switch -- let the RL policy
+    # take the actions and the LLM do the talking -- and it throws away the interesting half. The
+    # scorer beats the built-in AI 55% to 28% and cannot say a word about why; the model can hold a
+    # plan and explain itself and plays badly. Offering the scorer as something the model may ASK
+    # keeps the model in charge and gives it a strong opinion to accept or overrule.
+    ap.add_argument("--expert", metavar="CHECKPOINT",
+                    help="an RL checkpoint the model may consult as a tool")
+    ap.add_argument("--rl-path", default=None,
+                    help="path to the raifuwars-rl repo (default: sibling of this one, or RW_RL_PATH)")
+    ap.add_argument("--persona", default="",
+                    help="how the seat carries itself, e.g. 'a cheerful anime girl who takes the "
+                         "sport extremely seriously'. Presentation only -- it never licenses an "
+                         "illegal action.")
+    ap.add_argument("--chat-opener", action="store_true",
+                    help="invite a chat message at the start of each of your own turns")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -243,10 +258,23 @@ def main(argv=None):
     if args.policy == "llm" and args.url.startswith("https://") and not args.model:
         ap.error("a hosted endpoint needs an explicit --model (or --openrouter MODEL)")
 
+    expert = None
+    if args.expert:
+        from expert import Expert, ExpertUnavailable
+        try:
+            expert = Expert(args.expert, rl_path=args.rl_path)
+            print("[warrior] expert loaded: %s -- the model may consult it" % expert.name)
+        except ExpertUnavailable as exc:
+            # LOUD, NOT SILENT. A sidecar that quietly runs without the expert it was asked for
+            # produces a run whose numbers mean something other than what was intended, and
+            # nothing in the output would say so.
+            raise SystemExit("--expert given but unusable: %s" % exc)
+
     policy = build_policy(
         args.policy, url=args.url, model=args.model, temperature=args.temperature,
         max_tokens=args.max_tokens, thinking=args.thinking, vision=args.vision, seed=args.seed,
-        api_key=args.api_key)
+        api_key=args.api_key, expert=expert, persona=args.persona,
+        chat_opener=args.chat_opener)
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.sidecar = Sidecar(policy)

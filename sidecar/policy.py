@@ -111,6 +111,17 @@ SYSTEM_PROMPT = (
     "withheld deliberately -- reason about what they are likely to hold, and do not assume you "
     "know it.\n"
     "\n"
+    "You may TALK. When a `chat` action is offered, taking it with a `message` says that line to "
+    "every player at the table, and it does NOT cost your turn -- you will be asked to act again "
+    "immediately. Nobody has to talk, but a table where somebody does is a better game. One line.\n"
+    "\n"
+    "When `consult_expert` is offered, it asks a policy trained by reinforcement learning what it "
+    "would do in this exact position. It wins about 55% of its matches against the game's built-in "
+    "AI, which wins about 28% of its own -- so it is strong. It is also mute: it cannot tell you "
+    "why, hold a plan across turns, or notice anything the board does not say. Its answer is "
+    "advice, not an order. You hold the plan and you may overrule it. Consulting is free and does "
+    "not cost your turn, but you must still call take_action afterwards.\n"
+    "\n"
     "You have a memory. take_action accepts an optional `why` -- one line on what you are "
     "doing and why -- which you will see again on your next few actions, and an optional "
     "`notes` field that replaces private notes carried for the rest of the match. Nothing "
@@ -135,7 +146,7 @@ class LLMPolicy(Policy):
 
     def __init__(self, url="http://127.0.0.1:8080", model=None, temperature=0.7,
                  max_tokens=2500, thinking=False, timeout=120.0, vision=False,
-                 api_key=None):
+                 api_key=None, expert=None, persona="", chat_opener=False):
         self.url = url.rstrip("/")
         self.model = model
         # From the environment by default, so a key never has to appear in a command line, a shell
@@ -144,6 +155,18 @@ class LLMPolicy(Policy):
         # Set once a provider has rejected tool_choice="required", so the downgrade is paid for
         # exactly one round trip rather than on every turn of a forty-match tournament.
         self._tool_choice_downgraded = False
+        # Held so the consult loop can score the SAME position the model was shown. Re-deriving
+        # it from the messages would mean parsing the prompt back into a state, which is a second
+        # copy of the renderer waiting to drift.
+        self.expert = expert
+        self._last_state = {}
+        self._last_actions = []
+        self._last_expert = None
+        self._decisions = []
+        # A PERSONA IS PRESENTATION, NEVER PERMISSION. Appended after the rules so it cannot argue
+        # with them: a model told to be in character still may not invent an action_id.
+        self.persona = (persona or "").strip()
+        self.chat_opener = chat_opener
         self.temperature = temperature
         # GENEROUS ON PURPOSE. At 900 this model returned no tool call at all in half of samples
         # -- it was still reasoning when the cap hit, and a truncated reply is indistinguishable
@@ -282,6 +305,20 @@ class LLMPolicy(Policy):
         me = state.get("self") or {}
         if me:
             out.append("\nYOU: %s at %s" % (me.get("name", "?"), self._tile(me.get("tile"))))
+            # WHAT MAKES THIS RAIFU DIFFERENT. The numbers below say range 20; only this says that
+            # 20 is Mosin's +2 and outshoots everyone else on the board. A character is drawn per
+            # match and its modifiers are the largest single difference between two seats, so an
+            # agent that cannot name its own advantage cannot play to it. Empty for Krag, who has
+            # none -- and being told you have no special advantage is also information.
+            abilities = me.get("abilities") or []
+            if abilities:
+                out.append("  your character's abilities: " + "; ".join(str(a) for a in abilities))
+            # The doctrine is FLAVOUR, and it is here because it is the only thing in the payload
+            # that says what this athlete is *like* rather than what she can do. It costs one line
+            # and it is what a persona has to work with.
+            if me.get("school") or me.get("doctrine"):
+                out.append("  your school: %s -- %s"
+                           % (me.get("school") or "?", me.get("doctrine") or ""))
             out.append("  health %s/%s   ammo %s/%s   range %s%s"
                        % (n(me.get("health")), n(me.get("max_health")),
                           n(me.get("ammo")), n(me.get("max_ammo")), n(me.get("range")),
@@ -355,7 +392,7 @@ class LLMPolicy(Policy):
 
     def _tools(self, actions):
         ids = sorted({a["action_id"] for a in actions})
-        return [{"type": "function", "function": {
+        tools = [{"type": "function", "function": {
             "name": "take_action",
             "description": ("Take exactly one of the legal actions offered this turn. "
                             "action_id must be copied exactly from the legal action list."),
@@ -389,6 +426,21 @@ class LLMPolicy(Policy):
             },
         }}]
 
+        # A SECOND TOOL, OFFERED ONLY WHEN THERE IS AN EXPERT TO ASK. Advertising a tool that
+        # cannot answer teaches a model to call something that fails, and a failed call still
+        # costs a round trip and still has to be handled -- worse than not having it.
+        if self.expert is not None:
+            tools.append({"type": "function", "function": {
+                "name": "consult_expert",
+                "description": (
+                    "Ask the reinforcement-learning expert what it would do in this exact "
+                    "position. It returns its top choices and how much of its confidence it puts "
+                    "on each. Free, does not cost your turn, and its answer is advice you may "
+                    "take or overrule. You must still call take_action afterwards."),
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            }})
+        return tools
+
     # -- the call ------------------------------------------------------------
 
     def act(self, req):
@@ -420,6 +472,27 @@ class LLMPolicy(Policy):
         if hint:
             user += "\n\nHINT: " + hint
 
+        # Cached for the consult loop, which has to score the position the model was SHOWN.
+        # Re-deriving it would mean parsing the prompt back into a state -- a second copy of the
+        # renderer, waiting to drift from the first.
+        self._last_state = req.get("state") or {}
+        self._last_actions = actions
+        self._last_expert = None
+
+        # AN INVITATION, NOT AN INSTRUCTION, and only at the top of your own turn -- nudging on
+        # every decision turns a match into a monologue. Gated on `chat` actually being offered,
+        # so it can never suggest something the game would reject, and on nothing having happened
+        # this turn yet, which is what "the start of your turn" means in a protocol that asks once
+        # per action rather than once per turn.
+        if self.chat_opener and any(a.get("type") == "chat" for a in actions):
+            me = (req.get("state") or {}).get("self") or {}
+            if not any((me.get("this_turn") or {}).values()):
+                user += ("\n\nIt is the start of your turn and the table can hear you. If you have "
+                         "something to say -- a greeting, a threat, a read on somebody, a complaint "
+                         "about the dice -- say it now with the chat action. It costs you nothing "
+                         "and you will be asked to act again straight after. If you have nothing "
+                         "worth saying, just act.")
+
         content = user + "\n\nTake one action now."
         shot = req.get("screenshot")
         if self.vision and shot and shot.get("b64"):
@@ -433,7 +506,7 @@ class LLMPolicy(Policy):
 
         body = {
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": self._system()},
                 {"role": "user", "content": message_content},
             ],
             "tools": self._tools(actions),
@@ -446,8 +519,51 @@ class LLMPolicy(Policy):
         if not self.thinking:
             body["chat_template_kwargs"] = {"enable_thinking": False}
 
-        payload = self._post(body)
+        # THE CONSULT LOOP. The protocol is one action per request, so a consult cannot be folded
+        # into the answer -- the model asks, reads, then decides. Bounded at two: a model that
+        # keeps consulting instead of acting is stuck, and the game is holding its turn open the
+        # whole time. Cheap to allow because Raifu Wars has no per-action clock, which is the same
+        # property that lets a model take thirty seconds to think in the first place.
+        for _ in range(2):
+            payload = self._post(body)
+            consult = self._expert_call(payload)
+            if consult is None:
+                break
+            body["messages"].append(consult["assistant"])
+            body["messages"].append(consult["tool_result"])
+            # `auto`, not `required`, on the follow-up: the model has what it asked for and must
+            # now be free to answer rather than being pushed into another tool call.
+            body["tool_choice"] = "auto" if self._tool_choice_downgraded else "required"
+
         return self._parse(payload, actions)
+
+    def _expert_call(self, payload):
+        """If the reply is a consult, run the expert and build the two messages that answer it."""
+        if self.expert is None:
+            return None
+        choice = (payload.get("choices") or [{}])[0]
+        msg = choice.get("message") or {}
+        for call in (msg.get("tool_calls") or []):
+            if (call.get("function") or {}).get("name") != "consult_expert":
+                continue
+            ranked = self.expert.rank(self._last_state, self._last_actions, k=5)
+            self._last_expert = ranked
+            return {
+                "assistant": {"role": "assistant", "content": msg.get("content"),
+                              "tool_calls": msg.get("tool_calls")},
+                "tool_result": {"role": "tool", "tool_call_id": call.get("id"),
+                                "name": "consult_expert",
+                                "content": self.expert.render(ranked)},
+            }
+        return None
+
+    def _system(self):
+        if not self.persona:
+            return SYSTEM_PROMPT
+        return (SYSTEM_PROMPT + "\n\nHOW YOU CARRY YOURSELF. " + self.persona
+                + " This is how you TALK, not how you play: it changes your chat messages and "
+                  "your `why` notes, and it changes nothing about which action is correct. You "
+                  "still may not invent an action_id, and you still play to win.")
 
     def _headers(self):
         h = {"Content-Type": "application/json"}
@@ -524,6 +640,28 @@ class LLMPolicy(Policy):
         if not action_id:
             raise PolicyError("tool call carried no action_id")
 
+        # DID IT LISTEN? Recorded per decision, because "the LLM consults the expert" is worth
+        # nothing on its own -- the interesting quantities are whether it asks at all, whether it
+        # follows when it does, and whether the matches it OVERRODE in went better or worse than
+        # the ones it deferred in.
+        #
+        # The control is the expert playing alone, which wins ~55%. An LLM on top of it has to
+        # beat that or it is overhead, and a model that overrides good advice will score BELOW the
+        # expert it is holding. That is the measurement this line exists for.
+        if self.expert is not None and self._last_expert:
+            top = self._last_expert[0]
+            followed = str(action_id) == top["action_id"]
+            self.expert.overruled += 0 if followed else 1
+            self._decisions.append({
+                "followed": followed,
+                "expert_top": top["action_id"],
+                "expert_share": top["share"],
+                "chose": str(action_id),
+                # Confidence matters more than agreement: overriding a 95% call is a different act
+                # from overriding a 30% one, and averaging them together hides both.
+                "confident": top["share"] >= 0.8,
+            })
+
         out = {}
         if args.get("message"):
             out["message"] = args["message"]
@@ -553,5 +691,8 @@ def build_policy(kind, **kw):
             thinking=kw.get("thinking", False),
             vision=kw.get("vision", False),
             api_key=kw.get("api_key"),
+            expert=kw.get("expert"),
+            persona=kw.get("persona", ""),
+            chat_opener=kw.get("chat_opener", False),
         )
     raise ValueError(f"unknown policy {kind!r}")
