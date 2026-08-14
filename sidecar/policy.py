@@ -111,16 +111,36 @@ SYSTEM_PROMPT = (
     "withheld deliberately -- reason about what they are likely to hold, and do not assume you "
     "know it.\n"
     "\n"
-    "You may TALK. When a `chat` action is offered, taking it with a `message` says that line to "
-    "every player at the table, and it does NOT cost your turn -- you will be asked to act again "
-    "immediately. Nobody has to talk, but a table where somebody does is a better game. One line.\n"
-    "\n"
+    # NO STRATEGY SECTION HERE, AND THAT IS A RESULT RATHER THAN AN OVERSIGHT.
+    #
+    # One lived here: which tier track you are on, that points pay per point per turn so parking on
+    # one you already hold wastes the turn, that cover decides fights, that a bad shot is worse than
+    # a move. Every line was drawn from a measured failure, and it was measured after:
+    #
+    #     map           with it      without
+    #     Arboretum     0/8   0%     0/8   0%
+    #     Islands       1/8  12%     0/8   0%
+    #     Crossroads    2/8  25%     8/16 50%      <-- halved
+    #     TOTAL         3/24 12%     8/32 25%
+    #
+    # gpt-5.6-luna went 0/9 on Arboretum under the same text. Nothing improved and the one board
+    # the model was good at got worse: told to contest territory, it stopped kill-rushing, which
+    # was the only thing that had been working. The knowledge was never the bottleneck -- these
+    # models can already read cover and points off the board -- so telling them what matters does
+    # not make them able to act on it. The 57k-parameter RL net scores 50% on Arboretum from 33
+    # floats and no language at all.
+    #
+    # If you are about to add strategy advice here, measure it on Crossroads AND a cover board
+    # before keeping it. This is the second time an intuition about this prompt has been wrong.
     "When `consult_expert` is offered, it asks a policy trained by reinforcement learning what it "
-    "would do in this exact position. It wins about 55% of its matches against the game's built-in "
-    "AI, which wins about 28% of its own -- so it is strong. It is also mute: it cannot tell you "
-    "why, hold a plan across turns, or notice anything the board does not say. Its answer is "
-    "advice, not an order. You hold the plan and you may overrule it. Consulting is free and does "
-    "not cost your turn, but you must still call take_action afterwards.\n"
+    "would do in this exact position. Measured against the game's built-in AI on three boards it "
+    "wins 69%, 50% and 31% where a fair share is 25% -- so it is strong. What it is strongest at "
+    "is territory: on the hardest board it wins while averaging 0.1 kills a match. It is also mute: "
+    "it cannot tell you why, hold a plan "
+    "across turns, read the chat, or notice anything the board does not say. Its answer is advice, "
+    "not an order -- but when it disagrees with you about where to move, it is usually right and "
+    "you should have a reason. Consulting is free and does not cost your turn, but you must still "
+    "call take_action afterwards.\n"
     "\n"
     "You have a memory. take_action accepts an optional `why` -- one line on what you are "
     "doing and why -- which you will see again on your next few actions, and an optional "
