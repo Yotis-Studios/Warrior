@@ -18,7 +18,8 @@ import os
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import socket
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 try:
     from .policy import PolicyError, build_policy
@@ -67,11 +68,26 @@ class Sidecar:
                       "matches": len(self.matches)},
         }
 
+    @staticmethod
+    def _key(req):
+        """Idempotency key: the MATCH and the request id, never the request id alone.
+
+        The game mints ids as rw-t<turn>-s<seat>-n<seq> and resets both the turn number and the
+        sequence counter at every match boundary, so match 2 opens with the same "rw-t0-s0-n1" that
+        match 1 did. Keyed on request_id alone -- and never cleared between matches, only FIFO
+        evicted at 4096 -- the second match's opening decisions are answered with the FIRST match's
+        actions, chosen for a different board. It presents as a warrior that starts each match by
+        making a couple of nonsense moves and then recovers, which reads like a bad model rather
+        than a stale cache.
+        """
+        return (req.get("match_id") or "-", req.get("request_id"))
+
     def act(self, req):
         rid = req.get("request_id")
         if rid:
+            key = self._key(req)
             with self.lock:
-                cached = self.seen.get(rid)
+                cached = self.seen.get(key)
             if cached is not None:
                 log.info("request_id %s served from cache (client retried)", rid)
                 return cached
@@ -119,7 +135,7 @@ class Sidecar:
 
         if rid:
             with self.lock:
-                self.seen[rid] = resp
+                self.seen[self._key(req)] = resp
                 # Bounded. A long match is thousands of requests and this process may outlive
                 # several of them.
                 if len(self.seen) > 4096:
@@ -138,6 +154,123 @@ class Sidecar:
             if a.get("type") == "end_turn":
                 return a["action_id"]
         return actions[0]["action_id"] if actions else "end_turn"
+
+
+def dispatch(sc, path, req):
+    """One request -> (status, body). The ONLY place a route is decided.
+
+    Both transports call this. When HTTP owned the routing, adding TCP would have meant a second
+    copy of the same if-chain, and the two would drift the first time a route changed -- which is
+    how a transport ends up quietly supporting a different protocol version than the one beside it.
+    """
+    path = (path or "").rstrip("/")
+    try:
+        if path == "/v1/act":
+            return 200, sc.act(req)
+        if path == "/v1/match/start":
+            sc.policy.match_start(req)
+            log.info("match %s start, seat %s", req.get("match_id"), req.get("seat"))
+            return 200, {"ok": True}
+        if path == "/v1/match/end":
+            sc.policy.match_end(req)
+            counters = sc.matches.get(req.get("match_id") or "-", {})
+            log.info("match %s end: %s | %s", req.get("match_id"), req.get("result"), counters)
+            return 200, {"ok": True}
+        if path == "/v1/event":
+            sc.policy.event(req)
+            return 200, {"ok": True}
+        if path in ("/v1/health", "/health"):
+            return 200, sc.health()
+        return 404, {"error": "not found"}
+    except Exception as exc:                                        # noqa: BLE001
+        log.exception("handler failed")
+        return 500, {"error": str(exc)}
+
+
+def serve_tcp(sidecar, host, port, stop):
+    """A PERSISTENT framed connection, as an alternative to one HTTP request per decision.
+
+    WHY. Not latency -- that was measured and it is not the problem. A localhost HTTP round trip
+    costs single-digit milliseconds against 600-4000ms of model call, so the transport is under 0.3%
+    of a decision and rewriting it buys nothing measurable. What HTTP/1.0 costs is a NEW CONNECTION
+    per decision: across one screening the sidecar logged 38 resets and the client re-sent 2,357 of
+    5,999 requests. None of that broke a match -- the idempotency cache absorbed it -- but it is
+    thousands of connections and thousands of duplicate deliveries to be absorbed, and every one is
+    a chance for the absorbing to be wrong.
+
+    FRAMING. 4-byte big-endian length, then that many bytes of UTF-8 JSON:
+
+        {"path": "/v1/act", "body": {...}}   ->   {"status": 200, "body": {...}}
+
+    A length prefix rather than a delimiter because the payload is JSON containing arbitrary text --
+    chat messages included -- so any sentinel byte has to be escaped, and an unescaped one is a
+    parser that stops mid-message. The length is read first and exactly that many bytes are
+    consumed, which is also what makes TCP reassembly correct: recv() returns what it has, not what
+    was sent, and a reader that assumes one recv is one message works until a message spans packets.
+
+    ONE THREAD, NOT ONE PER CONNECTION. The game is a sequential client -- it asks for a decision
+    and blocks -- so concurrency buys nothing here, and a thread per request is what put 28-35 GB
+    and several thousand threads into this process once already. Connections are served one at a
+    time to completion.
+    """
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((host, port))
+    srv.listen(8)
+    srv.settimeout(0.5)                     # so `stop` is noticed without a signal
+    log.info("warrior sidecar tcp on %s:%d (framed json)", host, port)
+
+    def read_exactly(conn, n):
+        """n bytes or None at clean EOF. Short reads are normal, not an error."""
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = conn.recv(n - len(buf))
+            if not chunk:
+                return None
+            buf += chunk
+        return bytes(buf)
+
+    while not stop.is_set():
+        try:
+            conn, addr = srv.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        log.info("tcp client connected from %s", addr)
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        try:
+            while not stop.is_set():
+                head = read_exactly(conn, 4)
+                if head is None:
+                    break
+                size = int.from_bytes(head, "big")
+                # A frame larger than this is a bug or a stray non-client, not a decision: the
+                # biggest real payload measured is ~35 KB. Refusing beats allocating it.
+                if size <= 0 or size > (8 << 20):
+                    log.warning("tcp frame size %d refused", size)
+                    break
+                raw = read_exactly(conn, size)
+                if raw is None:
+                    break
+                try:
+                    msg = json.loads(raw.decode("utf-8", "replace"))
+                    status, body = dispatch(sidecar, msg.get("path"), msg.get("body") or {})
+                except json.JSONDecodeError as exc:
+                    status, body = 400, {"error": "bad JSON: %s" % exc}
+                out = json.dumps({"status": status, "body": body}).encode("utf-8")
+                conn.sendall(len(out).to_bytes(4, "big") + out)
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as exc:
+            # The game exiting mid-match closes its socket. Expected, not an error.
+            log.info("tcp client went away (%s)", type(exc).__name__)
+        except Exception:                                           # noqa: BLE001
+            log.exception("tcp connection failed")
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+    srv.close()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -162,47 +295,28 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length))
 
     def do_GET(self):
-        if self.path.rstrip("/") in ("/v1/health", "/health"):
-            self._send(200, self.server.sidecar.health())
-        else:
-            self._send(404, {"error": "not found"})
+        status, body = dispatch(self.server.sidecar, self.path, {})
+        self._send(status, body)
 
     def do_POST(self):
-        path = self.path.rstrip("/")
         try:
             req = self._read_json()
         except json.JSONDecodeError as exc:
             self._send(400, {"error": f"bad JSON: {exc}"})
             return
-
-        sc = self.server.sidecar
-        try:
-            if path == "/v1/act":
-                self._send(200, sc.act(req))
-            elif path == "/v1/match/start":
-                sc.policy.match_start(req)
-                log.info("match %s start, seat %s", req.get("match_id"), req.get("seat"))
-                self._send(200, {"ok": True})
-            elif path == "/v1/match/end":
-                sc.policy.match_end(req)
-                counters = sc.matches.get(req.get("match_id") or "-", {})
-                log.info("match %s end: %s | %s", req.get("match_id"),
-                         req.get("result"), counters)
-                self._send(200, {"ok": True})
-            elif path == "/v1/event":
-                sc.policy.event(req)
-                self._send(200, {"ok": True})
-            else:
-                self._send(404, {"error": "not found"})
-        except Exception as exc:  # noqa: BLE001
-            log.exception("handler failed")
-            self._send(500, {"error": str(exc)})
+        status, body = dispatch(self.server.sidecar, self.path, req)
+        self._send(status, body)
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Warrior sidecar")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8879)
+    # ON BY DEFAULT, at http port + 1. TCP is the transport; the port is derived rather than
+    # configured so parallel arms stay on distinct ports without a second variable to keep in step
+    # with the first. 0 disables it.
+    ap.add_argument("--tcp-port", type=int, default=-1,
+                    help="framed-JSON TCP port (default: --port + 1; 0 to disable)")
     ap.add_argument("--policy", default="random",
                     choices=["random", "first-legal", "llm"])
     ap.add_argument("--url", default="http://127.0.0.1:8080",
@@ -263,7 +377,7 @@ def main(argv=None):
         from expert import Expert, ExpertUnavailable
         try:
             expert = Expert(args.expert, rl_path=args.rl_path)
-            print("[warrior] expert loaded: %s -- the model may consult it" % expert.name)
+            print("[warrior] expert loaded: %s -- the model may consult it" % expert.name, flush=True)
         except ExpertUnavailable as exc:
             # LOUD, NOT SILENT. A sidecar that quietly runs without the expert it was asked for
             # produces a run whose numbers mean something other than what was intended, and
@@ -276,16 +390,42 @@ def main(argv=None):
         api_key=args.api_key, expert=expert, persona=args.persona,
         chat_opener=args.chat_opener)
 
-    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
-    httpd.sidecar = Sidecar(policy)
+    # SINGLE-THREADED. ThreadingHTTPServer's handler threads never exit here -- measured at ~7
+    # surviving threads and 3.8 MB per request, which reached 28-35 GB across one tournament,
+    # starved the machine, and killed the game with "Memory allocation failed". The same fix was
+    # already applied to the RL sidecar and NOT here, and this server then died mid-screening
+    # after ~900 retried requests, taking an arm's results with it.
+    #
+    # Threads bought nothing: the game is a SEQUENTIAL client. It asks for one decision and blocks
+    # until it gets it, so there is never a second request in flight for this server to overlap.
+    # Parallel arms are separate processes on separate ports.
+    httpd = HTTPServer((args.host, args.port), Handler)
+    sidecar = Sidecar(policy)
+    httpd.sidecar = sidecar
     log.info("warrior sidecar v%s on http://%s:%d  policy=%s%s",
              PROTOCOL_VERSION, args.host, args.port, policy.name,
              f" -> {args.url}" if args.policy == "llm" else "")
+
+    # TCP IS THE TRANSPORT; HTTP STAYS UP BESIDE IT. Not as an A/B: the game holds one connection
+    # for its whole life and speaks frames, while /v1/health over HTTP is what every script,
+    # readiness probe and curl in this repo already uses, and both go through the same dispatch()
+    # so neither can drift from the other.
+    stop = threading.Event()
+    tcp = None
+    tcp_port = args.port + 1 if args.tcp_port < 0 else args.tcp_port
+    if tcp_port:
+        tcp = threading.Thread(target=serve_tcp, name="warrior-tcp",
+                               args=(sidecar, args.host, tcp_port, stop), daemon=True)
+        tcp.start()
+
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         log.info("shutting down")
-        return 0
+    finally:
+        stop.set()
+        if tcp is not None:
+            tcp.join(timeout=2)
     return 0
 
 

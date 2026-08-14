@@ -81,6 +81,58 @@ client and is the stable, documented surface. Third parties implement one endpoi
 
 ---
 
+## 2b. Transport: one long-lived TCP connection
+
+**The game opens a single TCP connection and holds it for the life of the process.** Every
+decision travels over that one connection. This replaced one HTTP request per decision.
+
+Why: not speed. A localhost HTTP round trip is single-digit milliseconds against 600–4000 ms of
+model call — under 0.3% of a decision, so the transport was never the cost. What one connection
+per decision *did* cost was churn. Across one screening the sidecar logged 38 connection resets
+and answered **2,357 of 5,999 requests from its retry cache**. No match failed — the idempotency
+cache absorbed all of it — but that is thousands of connections and thousands of duplicate
+deliveries being absorbed, and each one is a chance for the absorbing to be wrong. A run that used
+to open 138 connections now opens one.
+
+### Framing
+
+4-byte **big-endian** length, then exactly that many bytes of UTF-8 JSON:
+
+```
+[len:u32be][{"path":"/v1/act","body":{ ...the same body as the HTTP POST... }}]
+[len:u32be][{"status":200,"body":{ ...the same reply as the HTTP response... }}]
+```
+
+`path` and `body` are the endpoint and payload from §3 unchanged, so a sidecar has **one**
+implementation of every route and the transport is genuinely just a transport.
+
+A length prefix rather than a delimiter, because the payload is JSON carrying arbitrary text —
+chat messages included — so any sentinel byte needs escaping, and an unescaped one is a parser
+that stops mid-message.
+
+### Rules for both ends
+
+- **Read the length first, then exactly that many bytes.** `recv` returns what has arrived, not
+  what was sent: one frame may span several reads and several frames may share one. A reader that
+  assumes one read is one message works until a payload crosses a packet boundary — and the
+  payloads here reach ~35 KB.
+- **Replies are in request order.** The game asks one question and waits, so a frame answers the
+  oldest outstanding request. Anything that wants to pipeline must carry the id in the frame.
+- **Refuse an implausible length** rather than allocating it. The reference implementation caps at
+  8 MB.
+- **A closed connection is not an error.** The game exits between matches; the sidecar outlives it
+  and accepts the next one.
+
+### Port, and what stays on HTTP
+
+The TCP port defaults to the **HTTP port + 1** on both ends, so parallel arms stay distinct
+without a second setting to keep in step. `--tcp-port 0` disables it; `RW_WARRIOR_TCP=0` makes the
+game use HTTP.
+
+**HTTP stays up beside it** and serves the same routes through the same dispatch. `GET /v1/health`
+over HTTP is what readiness probes and `curl` use, and a sidecar that cannot be reached by TCP is
+still a sidecar the game will talk to — the client falls back rather than forfeiting its turn.
+
 ## 3. Endpoints
 
 All JSON, all `POST` except health. Paths are versioned; a sidecar rejecting an unknown
