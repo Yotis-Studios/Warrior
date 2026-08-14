@@ -208,10 +208,23 @@ def serve_tcp(sidecar, host, port, stop):
     consumed, which is also what makes TCP reassembly correct: recv() returns what it has, not what
     was sent, and a reader that assumes one recv is one message works until a message spans packets.
 
-    ONE THREAD, NOT ONE PER CONNECTION. The game is a sequential client -- it asks for a decision
-    and blocks -- so concurrency buys nothing here, and a thread per request is what put 28-35 GB
-    and several thousand threads into this process once already. Connections are served one at a
-    time to completion.
+    ONE THREAD PER CONNECTION, AND NOT ONE PER REQUEST. The distinction is the whole bug this
+    docstring used to describe wrongly.
+
+    A thread per REQUEST is what put 28-35 GB and several thousand threads into this process once
+    already, and it buys nothing: the game asks for one decision and blocks, so there is never a
+    second request in flight on a connection.
+
+    But serving one CONNECTION at a time -- accept, run to EOF, accept the next -- means any client
+    that holds its socket open blocks every later one. A Runner that is still alive from a previous
+    match (this project reliably leaves a couple stuck behind modal dialogs, immune to taskkill)
+    keeps its connection, so the next match's frames are never read at all. The game waits out its
+    60s deadline, abandons the request, and the reply that finally arrives finds nothing pending.
+    Measured as 28% of decisions retried against 0.8% over HTTP, and it did not show up under a
+    policy that answers instantly, because nothing was ever queued behind anything.
+
+    Connections are bounded and long-lived -- one per game process -- so a thread each is a handful,
+    not thousands.
     """
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -230,13 +243,7 @@ def serve_tcp(sidecar, host, port, stop):
             buf += chunk
         return bytes(buf)
 
-    while not stop.is_set():
-        try:
-            conn, addr = srv.accept()
-        except socket.timeout:
-            continue
-        except OSError:
-            break
+    def serve_conn(conn, addr):
         log.info("tcp client connected from %s", addr)
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         try:
@@ -253,16 +260,25 @@ def serve_tcp(sidecar, host, port, stop):
                 raw = read_exactly(conn, size)
                 if raw is None:
                     break
+                mid = None
                 try:
                     msg = json.loads(raw.decode("utf-8", "replace"))
+                    mid = msg.get("id")
                     status, body = dispatch(sidecar, msg.get("path"), msg.get("body") or {})
                 except json.JSONDecodeError as exc:
                     status, body = 400, {"error": "bad JSON: %s" % exc}
-                out = json.dumps({"status": status, "body": body}).encode("utf-8")
+                # ECHO THE FRAME ID. The client pairs replies by it, and must not pair them by
+                # arrival order: the game can have more than one request outstanding -- its
+                # watchdog re-asks while an earlier one is still in flight -- and matching the
+                # oldest pending request to the next reply then binds an action chosen for one
+                # board to a decision about another.
+                out = json.dumps({"id": mid, "status": status, "body": body}).encode("utf-8")
                 conn.sendall(len(out).to_bytes(4, "big") + out)
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as exc:
             # The game exiting mid-match closes its socket. Expected, not an error.
             log.info("tcp client went away (%s)", type(exc).__name__)
+        except OSError as exc:
+            log.info("tcp connection ended (%s)", type(exc).__name__)
         except Exception:                                           # noqa: BLE001
             log.exception("tcp connection failed")
         finally:
@@ -270,6 +286,17 @@ def serve_tcp(sidecar, host, port, stop):
                 conn.close()
             except OSError:
                 pass
+
+    while not stop.is_set():
+        try:
+            conn, addr = srv.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        # Daemon: a stuck client must never keep the process alive at shutdown.
+        threading.Thread(target=serve_conn, args=(conn, addr),
+                         name="warrior-tcp-conn", daemon=True).start()
     srv.close()
 
 

@@ -24,10 +24,18 @@ HOST = "127.0.0.1"
 HTTP, TCP = 8987, 8988
 
 
-def frame(sock, path, body):
-    msg = json.dumps({"path": path, "body": body}).encode()
+_next_id = [0]
+
+
+def frame(sock, path, body, fid=None):
+    if fid is None:
+        _next_id[0] += 1
+        fid = _next_id[0]
+    msg = json.dumps({"path": path, "body": body, "id": fid}).encode()
     sock.sendall(len(msg).to_bytes(4, "big") + msg)
-    return read_frame(sock)
+    reply = read_frame(sock)
+    reply["_sent_id"] = fid
+    return reply
 
 
 def read_frame(sock):
@@ -121,6 +129,16 @@ def main():
               r1["body"]["action_id"] == "move_5_5" and r2["body"]["action_id"] == "move_9_9",
               "%s / %s" % (r1["body"]["action_id"], r2["body"]["action_id"]))
 
+        # THE ID MUST COME BACK, ON EVERY REPLY. The client pairs by it. When it did not exist and
+        # the client paired replies to the oldest outstanding request instead, 51% of decisions
+        # came back for the wrong board and were rejected as not offered -- against 0.8% over
+        # HTTP. Two frames with far-apart ids, checked individually.
+        a = frame(s, "/v1/act", act("M1", "id-a", A), fid=4242)
+        b = frame(s, "/v1/act", act("M1", "id-b", B), fid=99)
+        check("every reply echoes the id it was sent",
+              a.get("id") == 4242 and b.get("id") == 99,
+              "got %r and %r" % (a.get("id"), b.get("id")))
+
         # 1b. same request over both transports must agree
         t = frame(s, "/v1/act", act("M9", "same-1", B))["body"]["action_id"]
         h = http("/v1/act", act("M9", "same-1", B))["action_id"]
@@ -132,6 +150,26 @@ def main():
         check("new match, recycled request_id -> not the old answer",
               second in ("move_9_9", "end") and second != "move_5_5",
               "match A gave %s, match B gave %s" % (first, second))
+
+        # A SECOND CLIENT MUST BE SERVED WHILE THE FIRST HOLDS ITS SOCKET.
+        #
+        # This is the regression test for the bug that made the whole transport look fine and then
+        # fail only under a real model. Accepting one connection and serving it to EOF before
+        # accepting the next means any client that lingers blocks every later one -- and this
+        # project reliably leaves a Runner or two stuck behind a modal dialog, immune to taskkill,
+        # holding its connection open forever. The next match's frames were never read, the game
+        # waited out its 60s deadline and abandoned the request.
+        #
+        # `s` stays open and idle for the whole check, exactly like one of those zombies.
+        s2 = socket.create_connection((HOST, TCP), timeout=10)
+        try:
+            r2 = frame(s2, "/v1/act", act("M2", "second-client-1", B))
+            check("a second client is served while the first sits idle",
+                  r2["status"] == 200 and r2["body"]["action_id"] in ("move_9_9", "end"))
+            check("the first connection still works afterwards",
+                  frame(s, "/v1/health", {})["status"] == 200)
+        finally:
+            s2.close()
 
         r = frame(s, "/v1/match/end", {"match_id": "M1", "result": {"won": True}})
         check("match/end over TCP", r["status"] == 200)
