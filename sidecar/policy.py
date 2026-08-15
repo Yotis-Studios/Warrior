@@ -111,6 +111,13 @@ SYSTEM_PROMPT = (
     "withheld deliberately -- reason about what they are likely to hold, and do not assume you "
     "know it.\n"
     "\n"
+    "You may TALK. When a `chat` action is offered, taking it with a `message` says that line to "
+    "every player at the table, and it does NOT cost your turn -- you will be asked to act again "
+    "immediately. One line, under 100 characters.\n"
+    "\n"
+    "Answer anyone who speaks to you, react to what actually happened, and do not narrate your own "
+    "move -- the table can see the board.\n"
+    "\n"
     # NO STRATEGY SECTION HERE, AND THAT IS A RESULT RATHER THAN AN OVERSIGHT.
     #
     # One lived here: which tier track you are on, that points pay per point per turn so parking on
@@ -132,21 +139,18 @@ SYSTEM_PROMPT = (
     #
     # If you are about to add strategy advice here, measure it on Crossroads AND a cover board
     # before keeping it. This is the second time an intuition about this prompt has been wrong.
-    "When `consult_expert` is offered, it asks a policy trained by reinforcement learning what it "
-    "would do in this exact position. Measured against the game's built-in AI on three boards it "
-    "wins 69%, 50% and 31% where a fair share is 25% -- so it is strong. What it is strongest at "
-    "is territory: on the hardest board it wins while averaging 0.1 kills a match. It is also mute: "
-    "it cannot tell you why, hold a plan "
-    "across turns, read the chat, or notice anything the board does not say. Its answer is advice, "
-    "not an order -- but when it disagrees with you about where to move, it is usually right and "
-    "you should have a reason. Consulting is free and does not cost your turn, but you must still "
-    "call take_action afterwards.\n"
+    # THE ADVICE IS INLINE NOW, not a tool. It used to arrive through a `consult_expert` tool the
+    # model could choose to call, which cost a SECOND round trip per decision -- 6s instead of 3s,
+    # and 14 minutes a match -- and only helped on the turns the model remembered to ask.
+    "Legal actions are provided for you as tool calls below. Make decisions based on your own "
+    "judgement of the current state of gameplay which is provided in this context. Another AI "
+    "model provides you with recommended actions; generally, you should follow the highest "
+    "probability one for optimal success but again you are free to use your own discretion.\n"
     "\n"
-    "You have a memory. take_action accepts an optional `why` -- one line on what you are "
-    "doing and why -- which you will see again on your next few actions, and an optional "
-    "`notes` field that replaces private notes carried for the rest of the match. Nothing "
-    "else remembers your intentions between actions, so a plan that takes more than one "
-    "action only survives if you write it down.\n"
+    "Every take_action call requires a `justification` -- one short line on why you chose it. You "
+    "will see your own justifications back as your decision history on later turns, so they are "
+    "how a plan survives more than one action. take_action also accepts an optional `notes` field "
+    "that replaces a private scratchpad carried for the rest of the match; only you can see it.\n"
     "\n"
     "Play to win."
 )
@@ -182,11 +186,14 @@ class LLMPolicy(Policy):
         self._last_state = {}
         self._last_actions = []
         self._last_expert = None
-        self._decisions = []
         # A PERSONA IS PRESENTATION, NEVER PERMISSION. Appended after the rules so it cannot argue
         # with them: a model told to be in character still may not invent an action_id.
         self.persona = (persona or "").strip()
         self.chat_opener = chat_opener
+        # Bounded context. Both grow without limit over a 150-turn match otherwise.
+        self.chat_window = 10
+        self.history_window = 8
+        self._reasons = []          # (action_id, justification) this match
         self.temperature = temperature
         # GENEROUS ON PURPOSE. At 900 this model returned no tool call at all in half of samples
         # -- it was still reasoning when the cap hit, and a truncated reply is indistinguishable
@@ -241,7 +248,18 @@ class LLMPolicy(Policy):
 
     # -- prompt construction -------------------------------------------------
 
-    def _render_actions(self, actions):
+    def _render_actions(self, actions, advice=None):
+        """The legal set, optionally annotated with the RL policy's own probability mass.
+
+        INLINE, NOT A TOOL CALL. The advice used to arrive through a `consult_expert` tool the
+        model could choose to invoke, which cost a SECOND round trip per decision -- 6s instead of
+        3s, and 14 minutes a match -- and only helped on the turns the model remembered to ask.
+        Rendered here it is unconditional and free.
+
+        This is also the format a fine-tune will be trained on, so it has to be produced by this
+        function and not a copy in the dataset generator. A model trained on a layout it is never
+        served is a model trained on nothing.
+        """
         lines = ["LEGAL ACTIONS -- you may ONLY choose one of these action_id values:"]
         for a in actions:
             bits = []
@@ -251,6 +269,13 @@ class LLMPolicy(Policy):
                 bits.append(f"~{a['expected_damage']} damage")
             if a.get("note"):
                 bits.append(a["note"])
+            if advice is not None:
+                # FIRST in the bracket, not last. It is the single most useful number on the line
+                # and the notes can run long. Shown for every action the expert gives any mass to;
+                # below half a percent it is rounding noise dressed as a recommendation.
+                share = advice.get(a["action_id"])
+                if share is not None and share >= 0.005:
+                    bits.insert(0, f"expert {round(100 * share)}%")
             suffix = f"  [{'; '.join(bits)}]" if bits else ""
             label = a.get("label") or a.get("type") or a["action_id"]
             lines.append(f"  {a['action_id']}: {label}{suffix}")
@@ -316,8 +341,18 @@ class LLMPolicy(Policy):
         if notes:
             out.append("\nYOUR NOTES (written by you, only you can see them)")
             out.append("  " + notes.replace("\n", "\n  "))
+        # THE GAME SENDS ACTION IDS; THE SIDECAR KEEPS THE REASONS. `your_recent_actions` is a list
+        # of ids -- "move_9_2", "atk_s2", "end" -- which says what happened and nothing about why,
+        # so a model reading it back cannot tell a deliberate plan from a coincidence. The
+        # justification the model gave for each choice is held here, per match, and shown beside
+        # the id. This is also what a plan longer than one action is made of: nothing else carries
+        # intent between decisions.
         hist = state.get("your_recent_actions") or []
-        if hist:
+        if getattr(self, "_reasons", []):
+            out.append("\nYOUR RECENT DECISIONS (most recent last)")
+            for aid, why in getattr(self, "_reasons", [])[-getattr(self, "history_window", 8):]:
+                out.append("  - %s%s" % (aid, "  -- %s" % why if why else ""))
+        elif hist:
             out.append("\nYOUR LAST FEW ACTIONS")
             for h in hist:
                 out.append("  - %s" % h)
@@ -336,9 +371,6 @@ class LLMPolicy(Policy):
             # The doctrine is FLAVOUR, and it is here because it is the only thing in the payload
             # that says what this athlete is *like* rather than what she can do. It costs one line
             # and it is what a persona has to work with.
-            if me.get("school") or me.get("doctrine"):
-                out.append("  your school: %s -- %s"
-                           % (me.get("school") or "?", me.get("doctrine") or ""))
             out.append("  health %s/%s   ammo %s/%s   range %s%s"
                        % (n(me.get("health")), n(me.get("max_health")),
                           n(me.get("ammo")), n(me.get("max_ammo")), n(me.get("range")),
@@ -402,10 +434,17 @@ class LLMPolicy(Policy):
             for e in ev:
                 out.append("  - %s" % e)
 
+        # PRUNED TO THE LAST FEW. A long match accumulates chat without bound, and it is the one
+        # section that grows with nothing to cap it -- the board is fixed size and the action list
+        # is bounded by the rules. Old table talk is also the least useful thing in the prompt: a
+        # line from forty turns ago is not what anybody is answering.
         chat = state.get("chat") or []
         if chat:
             out.append("\nTABLE CHAT")
-            for c in chat:
+            shown = chat[-getattr(self, "chat_window", 10):]
+            if len(chat) > len(shown):
+                out.append("  (%d earlier lines not shown)" % (len(chat) - len(shown)))
+            for c in shown:
                 out.append("  seat %s: %s" % (n(c.get("seat")), c.get("text")))
 
         return "\n".join(out)
@@ -427,14 +466,15 @@ class LLMPolicy(Policy):
                                   "description": "the action_id you choose"},
                     "message": {"type": "string",
                                 "description": "what to say -- only for a chat action"},
-                    # WORKING MEMORY, and it rides on the action rather than needing a tool of
-                    # its own. A separate update_notes tool would cost a whole extra round trip
-                    # per thought, at which point remembering something is more expensive than
-                    # doing something -- and the note is most accurate at the moment of decision
-                    # anyway.
-                    "why": {"type": "string",
-                            "description": "one short line on why you chose this, so you can "
-                                           "remember your intention on your next action"},
+                    # REQUIRED, unlike the rest. Three things ride on it and none are optional:
+                    # it is fed back as the seat's own decision history next turn, it is what a
+                    # human reads when the seat does something surprising, and it is the field a
+                    # fine-tune is trained to produce -- a dataset of actions with no stated
+                    # reasoning teaches choosing without reasoning.
+                    "justification": {"type": "string",
+                                      "description": "one short line on why you chose this "
+                                                     "action. You will see it again as your own "
+                                                     "decision history on later turns."},
                     "notes": {"type": "string",
                               "description": "replace your private notes. They persist for the "
                                              "rest of the match and only you can see them. Use "
@@ -442,23 +482,14 @@ class LLMPolicy(Policy):
                                              "anything you want to remember about opponents. "
                                              "Omit this to leave your notes unchanged."},
                 },
-                "required": ["action_id"],
+                "required": ["action_id", "justification"],
             },
         }}]
 
-        # A SECOND TOOL, OFFERED ONLY WHEN THERE IS AN EXPERT TO ASK. Advertising a tool that
-        # cannot answer teaches a model to call something that fails, and a failed call still
-        # costs a round trip and still has to be handled -- worse than not having it.
-        if self.expert is not None:
-            tools.append({"type": "function", "function": {
-                "name": "consult_expert",
-                "description": (
-                    "Ask the reinforcement-learning expert what it would do in this exact "
-                    "position. It returns its top choices and how much of its confidence it puts "
-                    "on each. Free, does not cost your turn, and its answer is advice you may "
-                    "take or overrule. You must still call take_action afterwards."),
-                "parameters": {"type": "object", "properties": {}, "required": []},
-            }})
+        # ONE TOOL. There used to be a second, `consult_expert`, which the model could call to ask
+        # the RL policy what it would do. It is gone because the answer is now rendered inline on
+        # every action: the tool cost a second round trip per decision (6s instead of 3s, and 14
+        # minutes a match) and only helped on the turns the model chose to ask.
         return tools
 
     # -- the call ------------------------------------------------------------
@@ -468,8 +499,30 @@ class LLMPolicy(Policy):
         if not actions:
             return "end_turn", {}, None
 
-        user = self._render_state(req.get("state") or {})
-        user += "\n\n" + self._render_actions(actions)
+        state = req.get("state") or {}
+
+        # THE EXPERT'S WHOLE DISTRIBUTION, INLINE. Not a top-k and not a tool call: the model is
+        # choosing among exactly these actions, so it sees what the policy thinks of each.
+        #
+        # CHAT IS EXCLUDED. The net has never seen a chat action -- the game only began offering
+        # one offline recently -- so any mass it puts there is an artefact of features that do not
+        # describe talking, and presenting it would be inventing an opinion the net does not hold.
+        # In the hybrid seat the same leak hung a match outright: 58,317 chat actions, because chat
+        # does not consume the turn, so once the net rated it top it rated it top forever.
+        advice = None
+        if self.expert is not None:
+            try:
+                scorable = [a for a in actions if a.get("type") != "chat"]
+                if scorable:
+                    ranked = self.expert.rank(state, scorable, k=len(scorable))
+                    advice = {r["action_id"]: r["share"] for r in ranked}
+            except Exception as exc:                                # noqa: BLE001
+                # A turn without advice is still a playable turn. Saying so beats a silent
+                # fallback that looks like the expert having no opinion.
+                print("[warrior] expert unavailable this turn: %s" % exc, flush=True)
+
+        user = self._render_state(state)
+        user += "\n\n" + self._render_actions(actions, advice)
 
         last = req.get("last_action")
         if last and last.get("error"):
@@ -539,43 +592,17 @@ class LLMPolicy(Policy):
         if not self.thinking:
             body["chat_template_kwargs"] = {"enable_thinking": False}
 
-        # THE CONSULT LOOP. The protocol is one action per request, so a consult cannot be folded
-        # into the answer -- the model asks, reads, then decides. Bounded at two: a model that
-        # keeps consulting instead of acting is stuck, and the game is holding its turn open the
-        # whole time. Cheap to allow because Raifu Wars has no per-action clock, which is the same
-        # property that lets a model take thirty seconds to think in the first place.
-        for _ in range(2):
-            payload = self._post(body)
-            consult = self._expert_call(payload)
-            if consult is None:
-                break
-            body["messages"].append(consult["assistant"])
-            body["messages"].append(consult["tool_result"])
-            # `auto`, not `required`, on the follow-up: the model has what it asked for and must
-            # now be free to answer rather than being pushed into another tool call.
-            body["tool_choice"] = "auto" if self._tool_choice_downgraded else "required"
-
+        # ONE ROUND TRIP PER DECISION. There used to be a consult loop here: the model called
+        # `consult_expert`, read the answer, then decided -- two calls, so 6s a decision instead of
+        # 3s and 14 minutes a match, on a protocol that already asks ~90 decisions per match. The
+        # expert's whole distribution is rendered inline on the action list now, so the model has
+        # the same information before it answers and there is nothing left to ask for.
+        payload = self._post(body)
         return self._parse(payload, actions)
 
-    def _expert_call(self, payload):
-        """If the reply is a consult, run the expert and build the two messages that answer it."""
-        if self.expert is None:
-            return None
-        choice = (payload.get("choices") or [{}])[0]
-        msg = choice.get("message") or {}
-        for call in (msg.get("tool_calls") or []):
-            if (call.get("function") or {}).get("name") != "consult_expert":
-                continue
-            ranked = self.expert.rank(self._last_state, self._last_actions, k=5)
-            self._last_expert = ranked
-            return {
-                "assistant": {"role": "assistant", "content": msg.get("content"),
-                              "tool_calls": msg.get("tool_calls")},
-                "tool_result": {"role": "tool", "tool_call_id": call.get("id"),
-                                "name": "consult_expert",
-                                "content": self.expert.render(ranked)},
-            }
-        return None
+    def match_start(self, req):
+        """A new match is a new memory. Decisions from the last one are about a different board."""
+        self._reasons = []
 
     def _system(self):
         if not self.persona:
@@ -594,6 +621,26 @@ class LLMPolicy(Policy):
             h["HTTP-Referer"] = "https://github.com/yotisstudios/Warrior"
             h["X-Title"] = "Warrior protocol"
         return h
+
+    def complete(self, system, user, max_tokens=120, temperature=None):
+        """A plain completion -- no tools, no action list. Used by the hybrid seat for chat.
+
+        Shares _post, so retries, the tool_choice downgrade and auth behave identically to a real
+        decision. A separate HTTP path here would be a second client to keep in step with the
+        first, which is the shape of bug this codebase already has several of.
+        """
+        body = {
+            "model": self.model,
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": user}],
+            "max_tokens": max_tokens,
+            "temperature": self.temperature if temperature is None else temperature,
+        }
+        data = self._post(body)
+        if not data:
+            return ""
+        choice = (data.get("choices") or [{}])[0]
+        return (choice.get("message") or {}).get("content") or ""
 
     def _post(self, body):
         # RETRIED ON RATE LIMIT AND ON A GATEWAY HICCUP, which a local server never needed. A
@@ -687,9 +734,18 @@ class LLMPolicy(Policy):
             out["message"] = args["message"]
         # Passed through untouched. server.py forwards them to the game, which stores them
         # verbatim -- the moment anything here edits them they stop being the model's memory.
-        for k in ("why", "notes"):
-            if args.get(k):
-                out[k] = args[k]
+        # The game stores this as `why`; the tool calls it `justification`, which is what a
+        # model understands without being told. Mapped here rather than renaming the wire
+        # field, which every recorded trace and every existing dataset row already uses.
+        if args.get("justification"):
+            out["why"] = args["justification"]
+        # KEPT HERE, because the game does not send it back. `your_recent_actions` carries ids
+        # only, so without this the seat's own stated reasoning is lost the moment it is given.
+        if not hasattr(self, "_reasons"):
+            self._reasons = []
+        self._reasons.append((action_id, args.get("justification") or ""))
+        if args.get("notes"):
+            out["notes"] = args["notes"]
         return action_id, out, commentary
 
 
@@ -715,4 +771,26 @@ def build_policy(kind, **kw):
             persona=kw.get("persona", ""),
             chat_opener=kw.get("chat_opener", False),
         )
+    if kind == "hybrid":
+        # THE RL NET TAKES THE SEAT; the language model is optional and only writes chat. With no
+        # endpoint configured the seat plays and stays quiet, which is useful in its own right --
+        # it is the strongest opponent this project has, at no API cost.
+        try:
+            from .hybrid import HybridPolicy
+        except ImportError:
+            from hybrid import HybridPolicy
+        expert = kw.get("expert")
+        if expert is None:
+            raise ValueError("--policy hybrid needs --expert CHECKPOINT")
+        talker = None
+        if kw.get("model") or kw.get("openrouter"):
+            talker = LLMPolicy(
+                url=kw.get("url", "http://127.0.0.1:8080"),
+                model=kw.get("model"),
+                temperature=kw.get("temperature", 0.9),
+                max_tokens=200,
+                api_key=kw.get("api_key"),
+            )
+        return HybridPolicy(expert=expert, llm=talker,
+                            skill=kw.get("skill", 1.0), seed=kw.get("seed"))
     raise ValueError(f"unknown policy {kind!r}")
