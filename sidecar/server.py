@@ -344,8 +344,11 @@ def main(argv=None):
     # with the first. 0 disables it.
     ap.add_argument("--tcp-port", type=int, default=-1,
                     help="framed-JSON TCP port (default: --port + 1; 0 to disable)")
+    ap.add_argument("--skill", type=float, default=1.0,
+                    help="hybrid only: 1.0 plays the net's argmax; lower samples its own "
+                         "distribution, for an opponent that is good rather than perfect")
     ap.add_argument("--policy", default="random",
-                    choices=["random", "first-legal", "llm"])
+                    choices=["random", "first-legal", "llm", "hybrid"])
     ap.add_argument("--url", default="http://127.0.0.1:8080",
                     help="OpenAI-compatible endpoint, for --policy llm")
     ap.add_argument("--model", default=None)
@@ -413,7 +416,7 @@ def main(argv=None):
 
     policy = build_policy(
         args.policy, url=args.url, model=args.model, temperature=args.temperature,
-        max_tokens=args.max_tokens, thinking=args.thinking, vision=args.vision, seed=args.seed,
+        max_tokens=args.max_tokens, skill=args.skill, thinking=args.thinking, vision=args.vision, seed=args.seed,
         api_key=args.api_key, expert=expert, persona=args.persona,
         chat_opener=args.chat_opener)
 
