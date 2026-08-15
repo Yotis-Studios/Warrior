@@ -36,7 +36,9 @@ bash "$RW/tools/preflight.sh" || { echo "preflight failed -- not launching"; exi
 
 cd "$W"
 ARGS=(--policy "$POLICY" --port "$PORT")
-[ "$POLICY" = "hybrid" ] && ARGS+=(--expert "$EXPERT" --skill "$SKILL")
+# hybrid: the net plays and the model only talks, so it wants a small token budget and a
+# warm temperature -- the opposite of a seat that has to emit a legal action_id.
+[ "$POLICY" = "hybrid" ] && ARGS+=(--expert "$EXPERT" --skill "$SKILL" --max-tokens "${MAX_TOKENS:-120}" --temperature "${TEMPERATURE:-0.9}")
 # MAX_TOKENS IS PER MODEL, not a constant. 4000 is right for a hosted frontier model and wrong for
 # a small local one: with prompts at 1,600-2,700 tokens, asking a 4B for 4,000 more overruns its
 # context, and instead of an error you get a 30-second call that returns no tool call at all and

@@ -116,8 +116,12 @@ that stops mid-message.
   what was sent: one frame may span several reads and several frames may share one. A reader that
   assumes one read is one message works until a payload crosses a packet boundary — and the
   payloads here reach ~35 KB.
-- **Replies are in request order.** The game asks one question and waits, so a frame answers the
-  oldest outstanding request. Anything that wants to pipeline must carry the id in the frame.
+- **Every frame carries an `id`, and the reply echoes it.** Replies are paired BY THAT ID, never
+  by arrival order. "The game asks one question and waits" is not true in the failure cases: its
+  watchdog re-asks while an earlier request is still in flight, so order-pairing binds an action
+  chosen for one board to a decision about another. The client rejects it as not offered and
+  retries, which puts a second request in flight, which makes it worse. Measured at 51% of
+  decisions rejected against 0.8% over HTTP.
 - **Refuse an implausible length** rather than allocating it. The reference implementation caps at
   8 MB.
 - **A closed connection is not an error.** The game exits between matches; the sidecar outlives it
@@ -420,6 +424,76 @@ A persona, if a sidecar offers one, belongs after the rules and scoped to presen
 told to be in character still may not invent an `action_id`.
 
 ---
+
+## 8b. Who should actually hold the seat
+
+The protocol does not care what answers `/v1/act`. This section records what was measured, because
+the obvious answer turned out to be wrong twice and finding that out cost real time.
+
+**A language model alone plays one board and not the others.** Three frontier models, 8 matches per
+board, against the game's built-in AI, where a fair share for one seat of four is 25%:
+
+| | Crossroads | Arboretum | Islands |
+|---|---|---|---|
+| cover on the board | **0 tiles** | 172 (37%) | 321 (33%) |
+| gpt-5.6-luna / deepseek-v4-flash / gemini-3.5-flash-lite | **71%** | 8% | **0%** |
+| a 57,730-parameter RL policy | 69% | **50%** | **31%** |
+
+Crossroads is the only board in the pool with no cover at all, so every shot is clean
+line-of-sight and four knockouts wins outright. The models were not playing it well; they were
+kill-rushing a board that permits it. Given cover, they stop scoring entirely.
+
+**Telling the model how to win made it worse.** A prompt section explaining the win condition --
+which tier track you are on, that points pay per point per turn, that cover decides fights -- was
+written from the failures above and then measured: 3/24 with it against 8/32 without, and the one
+board the model was good at halved. The knowledge was never the bottleneck.
+
+**Fine-tuning a 4B on the RL policy's own decisions did not transfer its play.** 5,423 rows, the
+policy's probability mass inline on every action, 91.2% of targets its top choice. In live play the
+fine-tune agreed with that advice **34-60%** of the time, and the agreement tracked the win rate
+almost exactly:
+
+| | follows the advice | wins |
+|---|---|---|
+| Crossroads | 60% | 62% |
+| Arboretum | 45% | 0% |
+| Islands | 34% | 0% |
+
+It was trained on positions the expert reached, then asked to play from positions its own weaker
+choices produce. One divergence lands it somewhere the expert never was, and it compounds. That is
+the standard behaviour-cloning failure and it is not something more supervised data fixes.
+
+### So: the policy plays, the model talks
+
+`--policy hybrid` gives the seat to the RL policy and calls a language model only when there is
+something to SAY.
+
+    --policy hybrid --expert CKPT [--url URL | --openrouter MODEL] [--skill 1.0]
+
+This is also the only arrangement usable against a human. The protocol asks one decision per
+ACTION, so a match is ~90 round trips; at 3s a call that is five to fourteen minutes of a person
+watching a spinner. The policy answers in **2ms**, and the model is asked a handful of times a
+match.
+
+Two things it does deliberately:
+
+- **`--skill` below 1.0 samples the policy's own distribution instead of its argmax.** An
+  EV-maximising opponent can be strictly better at winning and worse to play against -- risking a
+  shot and missing is a large part of the fun. It samples from the policy's own mass rather than
+  mixing in random legal actions, so a weaker opponent is still recognisably playing rather than
+  occasionally walking into a wall.
+- **Chat fires on a reason, never a timer** -- somebody spoke, the match opened, an event happened,
+  low health, one tier from winning -- and that reason is what the model is told to react to. A
+  line with no reason behind it is the filler that makes a bot tiresome to sit with. Failure to
+  compose is silence, never a canned line: a fallback is indistinguishable from a working model
+  saying something bland.
+
+**The policy is never offered the chat action.** It has never seen one, so whatever score it
+assigns is an artefact of features that do not describe talking. Chat is also the only action that
+does not consume the turn, so an agent that rates it top rates it top again, forever -- 58,317 chat
+actions in a single match, which reached turn 4 in ten minutes. The game now offers chat once per
+turn (section 3), and the hybrid seat filters it out of the policy's ranking as well.
+
 
 ## 9. Open questions
 

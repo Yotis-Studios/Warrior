@@ -592,12 +592,20 @@ class LLMPolicy(Policy):
         first, which is the shape of bug this codebase already has several of.
         """
         body = {
-            "model": self.model,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": user}],
             "max_tokens": max_tokens,
             "temperature": self.temperature if temperature is None else temperature,
         }
+        if self.model:
+            body["model"] = self.model
+        # THINKING OFF, same as the decision path. Omitting this is not a small difference for a
+        # one-line reply: the model spends the whole budget reasoning and returns EMPTY content,
+        # which reads downstream as "the model had nothing to say" rather than as a broken call.
+        # A hybrid seat went a full match without speaking for exactly this reason, with no error
+        # anywhere -- the compose path treats failure as silence by design.
+        if not getattr(self, "thinking", False):
+            body["chat_template_kwargs"] = {"enable_thinking": False}
         data = self._post(body)
         if not data:
             return ""
@@ -744,8 +752,11 @@ def build_policy(kind, **kw):
         expert = kw.get("expert")
         if expert is None:
             raise ValueError("--policy hybrid needs --expert CHECKPOINT")
+        # A TALKER IS BUILT FOR A LOCAL URL TOO, not only for a hosted model name. Gating on
+        # --openrouter/--model meant pointing the seat at a local endpoint produced a silent
+        # warrior with no error anywhere -- it played perfectly and never said a word.
         talker = None
-        if kw.get("model") or kw.get("openrouter"):
+        if kw.get("model") or kw.get("openrouter") or kw.get("url"):
             talker = LLMPolicy(
                 url=kw.get("url", "http://127.0.0.1:8080"),
                 model=kw.get("model"),
