@@ -391,7 +391,12 @@ def main(argv=None):
     if args.openrouter:
         args.url = "https://openrouter.ai/api"
         args.model = args.openrouter
-        args.policy = "llm"
+        # ONLY IMPLIES --policy llm WHEN NO POLICY WAS ASKED FOR. It used to force it, which
+        # silently turned `--policy hybrid --openrouter MODEL` into a seat PLAYED by the hosted
+        # model rather than one merely TALKING through it -- the opposite arrangement, at ~90 API
+        # calls a match instead of a handful, and the only sign was one word in the startup line.
+        if args.policy == ap.get_default("policy"):
+            args.policy = "llm"
 
     # FAIL HERE, NOT ON THE FIRST TURN OF A TOURNAMENT. A hosted endpoint without a key answers
     # 401 on every request, and the game reads that as the seat failing to decide -- forty matches

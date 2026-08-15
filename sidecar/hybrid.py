@@ -55,11 +55,13 @@ CHAT_SYSTEM = (
 class HybridPolicy(Policy):
     name = "hybrid"
 
-    def __init__(self, expert, llm=None, skill=1.0, chat_cooldown=3, seed=None):
+    def __init__(self, expert, llm=None, skill=1.0, chat_cooldown=3, idle_turns=12,
+                 seed=None):
         self.expert = expert
         self.llm = llm                      # an LLMPolicy, used ONLY to compose chat
         self.skill = float(skill)
         self.chat_cooldown = int(chat_cooldown)
+        self.idle_turns = int(idle_turns)
         self.rng = random.Random(seed)
         self._reset_match()
 
@@ -67,6 +69,7 @@ class HybridPolicy(Policy):
         self.turns_since_spoke = 99         # so an opener can fire immediately
         self.seen_chat = 0                  # table lines already read
         self.spoke_this_match = 0
+        self.prev = None                    # last turn's readings, for delta events
 
     def capabilities(self):
         return {"vision": False, "chat": True, "commentary": True}
@@ -124,15 +127,56 @@ class HybridPolicy(Policy):
         pick = self.rng.choices(ranked, weights=weights, k=1)[0]
         return pick["action_id"], {}, None
 
+    # WHAT COUNTS AS WORTH SPEAKING ABOUT, in priority order. The first match wins.
+    #
+    # Written as a table because the first version was a chain of ifs that fired on three things
+    # and produced ONE line per match, all of them openers -- 3 lines across 3 matches, on 1.3% of
+    # the chances it was offered. A seat that only ever says "good luck" is not company.
+    #
+    # Everything here is a DELTA against the last turn, because the payload describes a position
+    # and not what happened to reach it. `events_since_last_turn` carries some of it, but not
+    # whether YOUR health fell, whether YOU took the knockout, or whether the board tipped -- and
+    # those are exactly the moments a person would say something.
+    def _events(self, state):
+        me = state.get("self") or {}
+        prev = self.prev
+        f = lambda k, d=0.0: float(me.get(k) or d)
+        pts = ((state.get("board") or {}).get("points")) or []
+        mine = sum(1 for p in pts if p.get("relationship") == "friendly" and not p.get("is_base"))
+        enemies = [p for p in (state.get("players") or []) if not p.get("is_self")]
+        etier = max((float(p.get("tier") or 0) for p in enemies), default=0.0)
+        now = {"kills": f("kills"), "deaths": f("deaths"), "health": f("health", 6),
+               "tier": f("tier"), "points": mine, "enemy_tier": etier}
+        out = []
+        if prev:
+            if now["kills"] > prev["kills"]:
+                out.append((90, "you just knocked somebody out"))
+            if now["deaths"] > prev["deaths"]:
+                out.append((85, "you were just knocked out"))
+            if now["tier"] > prev["tier"]:
+                out.append((80, "you just went up a grade, to tier %d" % int(now["tier"])))
+            if now["enemy_tier"] > prev["enemy_tier"] and now["enemy_tier"] >= 3:
+                out.append((75, "an opponent is one grade away from winning"))
+            if now["points"] > prev["points"]:
+                out.append((60, "you just took a capture point"))
+            if now["points"] < prev["points"]:
+                out.append((55, "you just lost a capture point"))
+            if now["health"] < prev["health"]:
+                out.append((50, "you just took a hit -- %d health left" % int(now["health"])))
+        self.prev = now
+        return out
+
     def _reason_to_speak(self, state):
         """Why speak RIGHT NOW, in words, or "" to stay quiet.
 
         Words rather than a bool, because the reason is also what the model is told to react to. A
         line with no reason behind it is the generic filler that makes a bot tiresome to sit with.
         """
+        events = self._events(state)
         chat = state.get("chat") or []
-        # SOMEBODY TALKED. Always answer, and check this first -- a table where the bot ignores you
-        # is worse than one that never speaks at all.
+
+        # SOMEBODY TALKED. Always answered, ahead of everything and exempt from the cooldown -- a
+        # table where the bot ignores you is worse than one that never speaks at all.
         fresh = [c for c in chat[self.seen_chat:] if float(c.get("seat", -1)) >= 0]
         if fresh:
             return "someone at the table just said: " + "; ".join(
@@ -141,18 +185,27 @@ class HybridPolicy(Policy):
         if self.spoke_this_match == 0 and float(state.get("turn") or 0) <= 2:
             return "the match is beginning -- greet the table"
 
-        if self.turns_since_spoke < self.chat_cooldown:
-            return ""
-
-        events = state.get("events_since_last_turn") or []
+        # Big moments jump a short cooldown; small ones wait out the full one. Without the split,
+        # a knockout and a one-point health scratch are equally likely to be what you hear about.
         if events:
-            return "this just happened: " + "; ".join(str(e)[:100] for e in events[:2])
+            pri, why = max(events)
+            # A major event is worth interrupting for, so its cooldown is zero rather
+            # than one: the seat had just spoken when it took a knockout, and a
+            # cooldown of 1 meant the knockout went unmentioned while the line it
+            # displaced was "good luck everyone".
+            cooldown = 0 if pri >= 75 else self.chat_cooldown
+            if self.turns_since_spoke >= cooldown:
+                return why
 
-        me = state.get("self") or {}
-        if float(me.get("health") or 6) <= 2:
-            return "you are badly hurt and still standing"
-        if float(me.get("tier") or 0) >= 3:
-            return "you are one grade from taking the match"
+        # THE IDLE POLL. Long stretches of a match are just walking, and a seat that only speaks on
+        # incident goes quiet for twenty turns. Rarer than an event so it cannot drown one out.
+        if self.turns_since_spoke >= self.idle_turns:
+            me = state.get("self") or {}
+            if float(me.get("tier") or 0) >= 3:
+                return "you are one grade from taking the match"
+            if float(me.get("health") or 6) <= 2:
+                return "you are badly hurt and still standing"
+            return "nothing has happened for a while -- say something to the table"
         return ""
 
     def _compose(self, state, why):
