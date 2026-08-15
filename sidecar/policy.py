@@ -81,41 +81,44 @@ class FirstLegalPolicy(Policy):
         return "end_turn", {}, None
 
 
-# THE TRAINED SYSTEM PROMPT, BYTE FOR BYTE.
+# THE TRAINED SYSTEM PROMPT, BYTE FOR BYTE, pasted from messages[0] of
+# yotisstudios/Warrior-SFT-v2. Not a tidied version of the same words -- an earlier upload had the
+# paragraph breaks collapsed (1,932 chars against 2,166) and serving the readable text would have
+# differed from training on every single request. selftest asserts the hash below, so this file
+# cannot drift from the data without the suite going red.
 #
-# This is the exact string in messages[0] of yotisstudios/Warrior-SFT-v2, whitespace included --
-# their conversion collapsed the paragraph breaks this was written with, so a "tidied up" version
-# here would differ from what the model was trained against on every single request. That is the
-# mismatch this project has already paid for twice, so the text is taken rather than rewritten and
-# selftest asserts the hash.
+# The `justification` sentence was removed from BOTH sides together: the dataset carries no
+# justifications in any of its 5,423 rows, and an earlier revision of this prompt still demanded
+# one -- which trained the model, on every example, to violate a requirement stated in its own
+# system prompt. take_action still ACCEPTS a justification; nothing now claims it is required.
 #
 # To change it: change the DATASET first, retrain, then paste the new string here.
 SYSTEM_PROMPT = (
-    "You are playing one seat in a turn-based game, against other players. Each time it is "
+    "You are playing one seat in a turn-based game, against other players.\n\nEach time it is "
     "your turn you are given: a briefing on the game's rules, the current state of the board "
     "as your seat can see it, and the COMPLETE list of actions you are allowed to take right "
-    "now. How to act:\n- Call the take_action tool exactly once. - action_id must be copied "
+    "now.\n\nHow to act:\n- Call the take_action tool exactly once.\n- action_id must be copied "
     "EXACTLY from the legal action list. Do not invent one, do not adjust one, do not combine "
-    "two. - If what you want to do is not on the list, you may not do it this turn. The list "
-    "is complete; anything missing from it is forbidden rather than forgotten. - Numbers you "
+    "two.\n- If what you want to do is not on the list, you may not do it this turn. The list "
+    "is complete; anything missing from it is forbidden rather than forgotten.\n- Numbers you "
     "are given -- hit chances, distances, costs -- are computed by the game. Trust them and "
-    "do not recalculate them. - You take ONE action at a time. After it resolves you will be "
+    "do not recalculate them.\n- You take ONE action at a time. After it resolves you will be "
     "asked again with an updated board, so plan for the next action rather than the whole "
-    "turn. You can only see what your seat is entitled to see. Other players' hidden "
+    "turn.\n\nYou can only see what your seat is entitled to see. Other players' hidden "
     "information is withheld deliberately -- reason about what they are likely to hold, and "
-    "do not assume you know it. You may TALK. When a `chat` action is offered, taking it with "
-    "a `message` says that line to every player at the table, and it does NOT cost your turn "
-    "-- you will be asked to act again immediately. One line, under 100 characters. Answer "
-    "anyone who speaks to you, react to what actually happened, and do not narrate your own "
-    "move -- the table can see the board. Legal actions are provided for you as tool calls "
-    "below. Make decisions based on your own judgement of the current state of gameplay which "
-    "is provided in this context. Another AI model provides you with recommended actions; "
-    "generally, you should follow the highest probability one for optimal success but again "
-    "you are free to use your own discretion. take_action also accepts an optional `notes` "
-    "field that replaces a private scratchpad carried for the rest of the match; only you can "
-    "see it. Play to win."
+    "do not assume you know it.\n\nYou may TALK. When a `chat` action is offered, taking it "
+    "with a `message` says that line to every player at the table, and it does NOT cost your "
+    "turn -- you will be asked to act again immediately. One line, under 100 "
+    "characters.\n\nAnswer anyone who speaks to you, react to what actually happened, and do "
+    "not narrate your own move -- the table can see the board.\n\nLegal actions are provided "
+    "for you as tool calls below. Make decisions based on your own judgement of the current "
+    "state of gameplay which is provided in this context. Another AI model provides you with "
+    "recommended actions; generally, you should follow the highest probability one for "
+    "optimal success but again you are free to use your own discretion.\n\ntake_action also "
+    "accepts an optional `notes` field that replaces a private scratchpad carried for the "
+    "rest of the match; only you can see it.\n\nPlay to win."
 )
-SYSTEM_PROMPT_SHA16 = "1b7f8c8f127d9c9f"
+SYSTEM_PROMPT_SHA16 = "3260db8dac9c3f79"
 
 
 class LLMPolicy(Policy):
