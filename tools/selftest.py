@@ -158,6 +158,14 @@ def suite_policy():
     # What is asserted instead is the part that is true regardless of strategy: the prompt must
     # tell the model to copy an id exactly from the offered list, which is the one instruction
     # every measured failure to act legally traces back to.
+    # THE PROMPT MUST STILL BE THE ONE THE MODEL WAS TRAINED ON, byte for byte. It is pasted from
+    # the dataset rather than written here, and whitespace counts: the conversion collapses the
+    # paragraph breaks, so a re-tidied version differs on every request from what training saw.
+    import hashlib
+    check("system_prompt_matches_the_trained_bytes",
+          hashlib.sha256(P.SYSTEM_PROMPT.encode()).hexdigest()[:16] == P.SYSTEM_PROMPT_SHA16,
+          P.SYSTEM_PROMPT_SHA16)
+
     sp = P.SYSTEM_PROMPT.lower()
     check("system_prompt_demands_exact_action_id",
           "exactly" in sp and "action_id" in sp)

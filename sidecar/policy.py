@@ -81,79 +81,41 @@ class FirstLegalPolicy(Policy):
         return "end_turn", {}, None
 
 
-# DELIBERATELY GAME-AGNOSTIC. This describes the PROTOCOL -- how a turn is asked and answered --
-# and says nothing about any particular game. Whatever the model needs to know about the game it
-# is playing arrives in `state.briefing`, written by the game itself.
+# THE TRAINED SYSTEM PROMPT, BYTE FOR BYTE.
 #
-# The split matters. Rules in a sidecar's system prompt would be a second copy that nobody updates
-# when the game changes, and a sidecar is meant to be pointed at any game that speaks the
-# protocol. It is also the same principle the protocol is built on: the rulebook lives in exactly
-# one implementation, and that implementation is the engine.
+# This is the exact string in messages[0] of yotisstudios/Warrior-SFT-v2, whitespace included --
+# their conversion collapsed the paragraph breaks this was written with, so a "tidied up" version
+# here would differ from what the model was trained against on every single request. That is the
+# mismatch this project has already paid for twice, so the text is taken rather than rewritten and
+# selftest asserts the hash.
+#
+# To change it: change the DATASET first, retrain, then paste the new string here.
 SYSTEM_PROMPT = (
-    "You are playing one seat in a turn-based game, against other players.\n"
-    "\n"
-    "Each time it is your turn you are given: a briefing on the game's rules, the current state "
-    "of the board as your seat can see it, and the COMPLETE list of actions you are allowed to "
-    "take right now.\n"
-    "\n"
-    "How to act:\n"
-    "- Call the take_action tool exactly once.\n"
-    "- action_id must be copied EXACTLY from the legal action list. Do not invent one, do not "
-    "adjust one, do not combine two.\n"
-    "- If what you want to do is not on the list, you may not do it this turn. The list is "
-    "complete; anything missing from it is forbidden rather than forgotten.\n"
-    "- Numbers you are given -- hit chances, distances, costs -- are computed by the game. Trust "
-    "them and do not recalculate them.\n"
-    "- You take ONE action at a time. After it resolves you will be asked again with an updated "
-    "board, so plan for the next action rather than the whole turn.\n"
-    "\n"
-    "You can only see what your seat is entitled to see. Other players' hidden information is "
-    "withheld deliberately -- reason about what they are likely to hold, and do not assume you "
-    "know it.\n"
-    "\n"
-    "You may TALK. When a `chat` action is offered, taking it with a `message` says that line to "
-    "every player at the table, and it does NOT cost your turn -- you will be asked to act again "
-    "immediately. One line, under 100 characters.\n"
-    "\n"
-    "Answer anyone who speaks to you, react to what actually happened, and do not narrate your own "
-    "move -- the table can see the board.\n"
-    "\n"
-    # NO STRATEGY SECTION HERE, AND THAT IS A RESULT RATHER THAN AN OVERSIGHT.
-    #
-    # One lived here: which tier track you are on, that points pay per point per turn so parking on
-    # one you already hold wastes the turn, that cover decides fights, that a bad shot is worse than
-    # a move. Every line was drawn from a measured failure, and it was measured after:
-    #
-    #     map           with it      without
-    #     Arboretum     0/8   0%     0/8   0%
-    #     Islands       1/8  12%     0/8   0%
-    #     Crossroads    2/8  25%     8/16 50%      <-- halved
-    #     TOTAL         3/24 12%     8/32 25%
-    #
-    # gpt-5.6-luna went 0/9 on Arboretum under the same text. Nothing improved and the one board
-    # the model was good at got worse: told to contest territory, it stopped kill-rushing, which
-    # was the only thing that had been working. The knowledge was never the bottleneck -- these
-    # models can already read cover and points off the board -- so telling them what matters does
-    # not make them able to act on it. The 57k-parameter RL net scores 50% on Arboretum from 33
-    # floats and no language at all.
-    #
-    # If you are about to add strategy advice here, measure it on Crossroads AND a cover board
-    # before keeping it. This is the second time an intuition about this prompt has been wrong.
-    # THE ADVICE IS INLINE NOW, not a tool. It used to arrive through a `consult_expert` tool the
-    # model could choose to call, which cost a SECOND round trip per decision -- 6s instead of 3s,
-    # and 14 minutes a match -- and only helped on the turns the model remembered to ask.
-    "Legal actions are provided for you as tool calls below. Make decisions based on your own "
-    "judgement of the current state of gameplay which is provided in this context. Another AI "
-    "model provides you with recommended actions; generally, you should follow the highest "
-    "probability one for optimal success but again you are free to use your own discretion.\n"
-    "\n"
-    "Give take_action a `justification` where you can -- one short line on why you chose it. You "
-    "will see your own justifications back as your decision history on later turns, so they are "
-    "how a plan survives more than one action. take_action also accepts an optional `notes` field "
-    "that replaces a private scratchpad carried for the rest of the match; only you can see it.\n"
-    "\n"
-    "Play to win."
+    "You are playing one seat in a turn-based game, against other players. Each time it is "
+    "your turn you are given: a briefing on the game's rules, the current state of the board "
+    "as your seat can see it, and the COMPLETE list of actions you are allowed to take right "
+    "now. How to act:\n- Call the take_action tool exactly once. - action_id must be copied "
+    "EXACTLY from the legal action list. Do not invent one, do not adjust one, do not combine "
+    "two. - If what you want to do is not on the list, you may not do it this turn. The list "
+    "is complete; anything missing from it is forbidden rather than forgotten. - Numbers you "
+    "are given -- hit chances, distances, costs -- are computed by the game. Trust them and "
+    "do not recalculate them. - You take ONE action at a time. After it resolves you will be "
+    "asked again with an updated board, so plan for the next action rather than the whole "
+    "turn. You can only see what your seat is entitled to see. Other players' hidden "
+    "information is withheld deliberately -- reason about what they are likely to hold, and "
+    "do not assume you know it. You may TALK. When a `chat` action is offered, taking it with "
+    "a `message` says that line to every player at the table, and it does NOT cost your turn "
+    "-- you will be asked to act again immediately. One line, under 100 characters. Answer "
+    "anyone who speaks to you, react to what actually happened, and do not narrate your own "
+    "move -- the table can see the board. Legal actions are provided for you as tool calls "
+    "below. Make decisions based on your own judgement of the current state of gameplay which "
+    "is provided in this context. Another AI model provides you with recommended actions; "
+    "generally, you should follow the highest probability one for optimal success but again "
+    "you are free to use your own discretion. take_action also accepts an optional `notes` "
+    "field that replaces a private scratchpad carried for the rest of the match; only you can "
+    "see it. Play to win."
 )
+SYSTEM_PROMPT_SHA16 = "1b7f8c8f127d9c9f"
 
 
 class LLMPolicy(Policy):
@@ -341,21 +303,16 @@ class LLMPolicy(Policy):
         if notes:
             out.append("\nYOUR NOTES (written by you, only you can see them)")
             out.append("  " + notes.replace("\n", "\n  "))
-        # THE GAME SENDS ACTION IDS; THE SIDECAR KEEPS THE REASONS. `your_recent_actions` is a list
-        # of ids -- "move_9_2", "atk_s2", "end" -- which says what happened and nothing about why,
-        # so a model reading it back cannot tell a deliberate plan from a coincidence. The
-        # justification the model gave for each choice is held here, per match, and shown beside
-        # the id. This is also what a plan longer than one action is made of: nothing else carries
-        # intent between decisions.
-        hist = state.get("your_recent_actions") or []
-        if getattr(self, "_reasons", []):
-            out.append("\nYOUR RECENT DECISIONS (most recent last)")
-            for aid, why in getattr(self, "_reasons", [])[-getattr(self, "history_window", 8):]:
-                out.append("  - %s%s" % (aid, "  -- %s" % why if why else ""))
-        elif hist:
-            out.append("\nYOUR LAST FEW ACTIONS")
-            for h in hist:
-                out.append("  - %s" % h)
+        # NO DECISION HISTORY. It rendered the seat's own past choices with the justification it
+        # gave for each, which is how a plan survived more than one action -- and it is disabled
+        # because the v2 training data contains no justifications at all. Serving a section the
+        # model never saw in training is the mismatch this file keeps paying for, and with the
+        # reasons gone the section degrades to a bare list of ids the state already implies.
+        #
+        # Turn it back on in the same commit that puts justifications back in the DATASET, not
+        # before.
+        if False:                                                   # noqa: SIM108 -- see above
+            pass
 
         me = state.get("self") or {}
         if me:
