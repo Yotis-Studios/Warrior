@@ -37,7 +37,19 @@ bash "$RW/tools/preflight.sh" || { echo "preflight failed -- not launching"; exi
 cd "$W"
 ARGS=(--policy "$POLICY" --port "$PORT")
 [ "$POLICY" = "hybrid" ] && ARGS+=(--expert "$EXPERT" --skill "$SKILL")
-[ "$POLICY" = "llm" ] && ARGS+=(--max-tokens 4000) && [ -n "${EXPERT:-}" ] && ARGS+=(--expert "$EXPERT")
+# MAX_TOKENS IS PER MODEL, not a constant. 4000 is right for a hosted frontier model and wrong for
+# a small local one: with prompts at 1,600-2,700 tokens, asking a 4B for 4,000 more overruns its
+# context, and instead of an error you get a 30-second call that returns no tool call at all and
+# falls back. Measured: 16 fallbacks in the first minutes of a run, and 1.0s median once it was 200.
+if [ "$POLICY" = "llm" ]; then
+  ARGS+=(--max-tokens "${MAX_TOKENS:-4000}" --temperature "${TEMPERATURE:-0.7}")
+  [ -n "${EXPERT:-}" ] && ARGS+=(--expert "$EXPERT")
+fi
+# A LOCAL ENDPOINT, not OpenRouter. URL= points the llm policy at an OpenAI-compatible server on
+# this machine -- a fine-tune under llama.cpp, say -- with no API key and no per-call cost.
+if [ -n "${URL:-}" ]; then
+  ARGS+=(--url "$URL")
+fi
 if [ -n "$MODEL" ]; then
   export OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-$(tr -d ' \r\n' < /c/Users/Nicholas/Projects/openrouter.txt)}
   ARGS+=(--openrouter "$MODEL")

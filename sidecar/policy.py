@@ -147,7 +147,7 @@ SYSTEM_PROMPT = (
     "model provides you with recommended actions; generally, you should follow the highest "
     "probability one for optimal success but again you are free to use your own discretion.\n"
     "\n"
-    "Every take_action call requires a `justification` -- one short line on why you chose it. You "
+    "Give take_action a `justification` where you can -- one short line on why you chose it. You "
     "will see your own justifications back as your decision history on later turns, so they are "
     "how a plan survives more than one action. take_action also accepts an optional `notes` field "
     "that replaces a private scratchpad carried for the rest of the match; only you can see it.\n"
@@ -466,11 +466,13 @@ class LLMPolicy(Policy):
                                   "description": "the action_id you choose"},
                     "message": {"type": "string",
                                 "description": "what to say -- only for a chat action"},
-                    # REQUIRED, unlike the rest. Three things ride on it and none are optional:
-                    # it is fed back as the seat's own decision history next turn, it is what a
-                    # human reads when the seat does something surprising, and it is the field a
-                    # fine-tune is trained to produce -- a dataset of actions with no stated
-                    # reasoning teaches choosing without reasoning.
+                    # OPTIONAL, and it was required until a fine-tune was measured against it.
+                    # Requiring it doubles what the model must emit correctly on every decision,
+                    # and a 4B trained on this format failed to produce a tool call at all on 36%
+                    # of decisions -- emitting the learned justification phrasing as prose instead.
+                    # It is still worth asking for: it feeds the seat's own decision history back
+                    # next turn, it is what a human reads when the seat does something surprising,
+                    # and it is what a fine-tune learns to produce. Asked for, not demanded.
                     "justification": {"type": "string",
                                       "description": "one short line on why you chose this "
                                                      "action. You will see it again as your own "
@@ -482,7 +484,7 @@ class LLMPolicy(Policy):
                                              "anything you want to remember about opponents. "
                                              "Omit this to leave your notes unchanged."},
                 },
-                "required": ["action_id", "justification"],
+                "required": ["action_id"],
             },
         }}]
 
