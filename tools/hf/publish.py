@@ -53,12 +53,24 @@ def stage(run, repo, ckpt="last.pt", outdir=None):
     import torch
     blob = torch.load(src, map_location="cpu", weights_only=False)
     sd = blob["model"] if isinstance(blob, dict) and "model" in blob else blob
+    ds = int(sd["state_tower.0.weight"].shape[1])
+    da = int(sd["action_tower.0.weight"].shape[1])
+    hid = int(sd["state_tower.0.weight"].shape[0])
+    emb = int(sd["state_tower.2.weight"].shape[0])
+    # The diagram is generated, not templated: `EMBED*3` substituted as text renders as "64*3",
+    # and a reader checking the head width against the weights would find a sum instead of a
+    # number. Every figure here is read off the tensors it describes.
+    arch = "```\n%s```" % "".join(
+        "%-6s %-7d -> %-4d -> %d%s\n" % (n, i, hid, o, tail)
+        for n, i, o, tail in (("state", ds, emb, ""),
+                              ("action", da, emb, ""),
+                              ("head", emb * 3, 1, "        softmax over exactly the N offered"),
+                              ("value", emb, 1, "")))
     dims = {
-        "D_STATE": str(sd["state_tower.0.weight"].shape[1]),
-        "D_ACTION": str(sd["action_tower.0.weight"].shape[1]),
-        "HIDDEN": str(sd["state_tower.0.weight"].shape[0]),
-        "EMBED": str(sd["state_tower.2.weight"].shape[0]),
-        "COVERFLAG": "1" if sd["state_tower.0.weight"].shape[1] > 33 else "0",
+        "ARCHBLOCK": arch,
+        "D_STATE": str(ds), "D_ACTION": str(da),
+        "HIDDEN": str(hid), "EMBED": str(emb),
+        "COVERFLAG": "1" if ds > 33 else "0",
         "WEIGHTS": weights,
     }
     common = open(os.path.join(HERE, "cards", "_common.md"), encoding="utf-8").read()

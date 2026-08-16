@@ -8,12 +8,7 @@ and the score is their elementwise product — so nothing in the network knows h
 are, which is the requirement: the legal set runs from 2 to ~670 between decisions and varies with
 board size, dice roll and hand.
 
-```
-state  D_STATE  -> HIDDEN -> EMBED
-action D_ACTION -> HIDDEN -> EMBED
-head   EMBED*3  -> HIDDEN -> 1        softmax over exactly the N offered
-value  EMBED    -> HIDDEN -> 1
-```
+ARCHBLOCK
 
 Scoring rather than classifying makes an illegal action *unrepresentable* rather than merely
 penalised, and lets the same weights run on a 17×21 board and a 27×27 one. A classifier over "all
