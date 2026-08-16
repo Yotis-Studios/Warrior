@@ -135,6 +135,16 @@ def main():
         print("dry run -- not uploading")
         return 0
 
+    # The verify step imports the staged modules, which writes __pycache__ INTO the folder about
+    # to be uploaded. Left alone it publishes .pyc files built by whatever interpreter happened to
+    # run the check -- noise in the file list, and stale bytecode that shadows a later edit for
+    # anyone who downloads it.
+    for root, dirs, files in os.walk(staged):
+        for d in list(dirs):
+            if d == "__pycache__":
+                shutil.rmtree(os.path.join(root, d))
+                dirs.remove(d)
+
     from huggingface_hub import HfApi
     api = HfApi()
     rid = "%s/%s" % (ORG, args.repo)
