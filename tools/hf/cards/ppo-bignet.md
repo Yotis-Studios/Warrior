@@ -36,7 +36,21 @@ part.
 | sim vs greedy, Arboretum only | 75.8% | 73.8% | 78.0% | 78.5% |
 | training mean return | **16.90** | 16.02 | — | 10.92 |
 
-REALGAME
+And in the real game, against the built-in AI, 16 matches per board where chance for one seat of
+four is 25%:
+
+| board | this model | `ppo-selfplay` (58K) | `ppo-selfplay2` (58K) |
+|---|---|---|---|
+| Arboretum | 2/16 — 12% | **8/16 — 50%** | 2/16 — 12% |
+| Islands | 1/16 — 6% | 5/16 — 31% | **13/16 — 81%** |
+| Crossroads | 8/16 — 50% | 69% | **75%** |
+| **overall** | **11/48 — 23%** | 24/48 — 50% | 27/48 — 56% |
+
+23% against a chance rate of 25%. This model is **not distinguishable from a policy picking at
+random among the offered actions** (p=0.68), on a board pool where its 58K-parameter twin scores
+50–56%. Its one respectable board is Crossroads, the one with no cover — the same board it
+dominates in the sim.
+
 
 Read the first two rows together. This model has the **highest training return of any
 greedy-trained arm** and the **lowest head-to-head win rate of any policy measured** — 3.8%, where

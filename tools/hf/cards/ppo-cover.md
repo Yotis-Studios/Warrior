@@ -85,14 +85,26 @@ parameters. Read its scores as a seed replicate, not as a cover-aware policy.
 
 ## Results
 
-REALGAME
+Real game, against the built-in AI, 16 matches per board, chance 25%:
+
+| board | this model | `ppo-sim` (its true sibling) | `ppo-selfplay` |
+|---|---|---|---|
+| Arboretum | 2/16 — 12% | 13% *(40 matches)* | **8/16 — 50%** |
+| Islands | 0/16 — 0% | not evaluated | 5/16 — 31% |
+| Crossroads | 9/16 — 56% | 68% *(40 matches)* | 69% |
+| **overall** | **11/48 — 23%** | — | 24/48 — 50% |
+
+23% against a chance rate of 25% — **not distinguishable from picking at random** (p=0.68). And on
+Arboretum, the board this arm exists to fix, it scores **12% against `ppo-sim`'s 13%**: exactly
+where a policy with three dead features and a different random seed should land. That prediction was
+made before the run and it held, which is the strongest evidence that the diagnosis above is right.
 
 The sim numbers make the same point from the other side. Against three greedy bots, **on Arboretum
 specifically**, 400 matches each:
 
 | policy | sim, Arboretum | real game, Arboretum |
 |---|---|---|
-| this model | 79.0% | REALARB |
+| this model | 79.0% | 12% |
 | `ppo-selfplay` | 78.0% | 50% |
 | `ppo-selfplay2` | 78.5% | 12% |
 | `ppo-bignet` | 75.8% | 12% |
