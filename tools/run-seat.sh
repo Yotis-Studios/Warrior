@@ -67,7 +67,23 @@ for _ in $(seq 1 60); do
 done
 
 cd "$RW"
+SCRATCH=${LOCALAPPDATA:-$HOME}/Temp/raifuwars-compile
 for MAP in $MAPS; do
+  # RE-CHECK PER MAP, not once at launch. preflight cannot see a driver that takes a lock AFTER
+  # this run starts, and the failure it misses is the expensive one: the arm exits inside a second
+  # and its empty log reads as a map that simply went badly. Islands lost three runs this way.
+  #
+  # Only STALE locks are fatal -- one held by a live pid means a legitimate concurrent run, which
+  # preflight already refuses to start alongside.
+  for f in "$SCRATCH"/warrior-tourney-*.lock; do
+    [ -e "$f" ] || continue
+    pid=$(tr -dc '0-9' < "$f" 2>/dev/null)
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+      echo "!! stale lock $(basename "$f") (pid ${pid:-?} gone) -- $MAP would exit instantly. Stopping."
+      kill $SC 2>/dev/null
+      exit 1
+    fi
+  done
   echo "===== $MAP $(date +%H:%M:%S) ====="
   RW_TOURNEY_ID="$TAG-$MAP" RW_MAP="$MAP" RW_TRACE_OUT="$W/data/$TAG-tr-$MAP.jsonl" \
     tools/warrior-tournament.sh "$MATCHES" "http://127.0.0.1:$PORT" 2>&1 \
