@@ -25,8 +25,15 @@ for name in "$@"; do
   [ -f "$path" ] || { echo "!! no checkpoint at $path -- skipping $name"; continue; }
   echo
   echo "######## $name  ($(date +%H:%M:%S))"
-  TAG="ck-$name" EXPERT="$path" MATCHES="$MATCHES" MAPS="$MAPS" \
-    POLICY=hybrid PORT="$PORT" bash "$W/tools/run-seat.sh"
+  if ! TAG="ck-$name" EXPERT="$path" MATCHES="$MATCHES" MAPS="$MAPS" \
+       POLICY=hybrid PORT="$PORT" bash "$W/tools/run-seat.sh"; then
+    # STOP THE WHOLE SWEEP. An arm refuses for environmental reasons -- a rival run holding the
+    # lock, a port that will not release, a sidecar serving somebody else's checkpoint -- and every
+    # one of those applies just as much to the arms after it. Carrying on produces a table with
+    # quiet holes in it, which is how a half-finished sweep gets read as a whole one.
+    echo "!! $name failed. Stopping the sweep rather than running the rest into the same fault."
+    exit 1
+  fi
 done
 
 echo

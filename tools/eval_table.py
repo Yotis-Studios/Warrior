@@ -21,8 +21,8 @@ DATA = os.path.join(ROOT, "data")
 
 MATCH = re.compile(r"match (\d+): warrior on seat (\d+), won=(\d), turns=(\d+)")
 # The summary's own warrior row: seats, wins, win%, stars, kills, deaths.
-WARRIOR = re.compile(r"^\s*warrior\s+(\d+)\s+(\d+)\s+(\d+)%\s+(\d+)\s+([\d.]+)\s+([\d.]+)")
-CLASSIC = re.compile(r"^\s*classic\s+(\d+)\s+(\d+)\s+(\d+)%\s+(\d+)\s+([\d.]+)\s+([\d.]+)")
+WARRIOR = re.compile(r"^\s*warrior\s+(\d+)\s+(\d+)\s+(\d+)%\s+(\d+)\s+([\d.]+)\s+([\d.]+)", re.M)
+CLASSIC = re.compile(r"^\s*classic\s+(\d+)\s+(\d+)\s+(\d+)%\s+(\d+)\s+([\d.]+)\s+([\d.]+)", re.M)
 
 
 def read(tag, mp):

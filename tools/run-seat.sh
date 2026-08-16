@@ -32,6 +32,31 @@ RUNNER=$(cygpath -w "${RW_RUNNER:-/c/ProgramData/GameMakerStudio2-LTS2026/Cache/
 GAME=$(cygpath -w "${RW_GAME_WIN:-/c/Users/Nicholas/Documents/GameMakerStudio2/raifuwars-rl/runs/game/RaifuWars.win}")
 export RW_LAUNCH="$RUNNER -game $GAME"
 
+# ONE SEAT RUN AT A TIME, ENFORCED BY A LOCK THIS SCRIPT OWNS.
+#
+# preflight tries to detect a rival driver with `ps -W | grep warrior-tournament`, and under MSYS
+# that finds nothing: `ps` reports the executable (/usr/bin/bash) and never the script name. So the
+# check passed while a previous sweep was still running, and two of them ran for 45 minutes writing
+# THE SAME result filenames over each other on THE SAME port. `pkill -f eval-checkpoints.sh` had
+# reported success and killed nothing, for the same reason.
+#
+# A lock directory this script creates itself needs no pattern matching to find. mkdir is atomic,
+# so two simultaneous starts cannot both win it.
+LOCK="$W/data/.seat-run.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  OTHER=$(cat "$LOCK/pid" 2>/dev/null)
+  if [ -n "$OTHER" ] && kill -0 "$OTHER" 2>/dev/null; then
+    echo "!! another seat run is live (pid $OTHER, $(cat "$LOCK/what" 2>/dev/null)). Refusing."
+    echo "   Two of these overwrite each other's result files and share a sidecar port."
+    exit 1
+  fi
+  echo "  clearing a seat-run lock left by dead pid ${OTHER:-?}"
+  rm -rf "$LOCK"; mkdir "$LOCK" || exit 1
+fi
+echo $$ > "$LOCK/pid"
+echo "$TAG $EXPERT" > "$LOCK/what"
+trap 'rm -rf "$LOCK"' EXIT
+
 bash "$RW/tools/preflight.sh" || { echo "preflight failed -- not launching"; exit 1; }
 
 cd "$W"
@@ -118,6 +143,21 @@ for MAP in $MAPS; do
       exit 1
     fi
   done
+  # AND RE-CHECK WHOSE CHECKPOINT IS ANSWERING, BEFORE EVERY MAP. Checking once at launch is not
+  # enough: when two sweeps overlapped, each arm passed its start-up check and then had the port
+  # taken from under it partway through, so maps 2 and 3 of an arm were played by the other
+  # sweep's network. The result was a complete table in which one arm's Crossroads log was
+  # byte-identical to another's -- 16 matches, same wins, same stars, same kills.
+  if [ "$POLICY" = "hybrid" ]; then
+    GOT=$(curl -s --max-time 5 "http://127.0.0.1:$PORT/v1/health" \
+          | sed -n 's/.*"expert": *"\([^"]*\)".*/\1/p')
+    if [ "$GOT" != "$WANT" ]; then
+      echo "!! before $MAP: port $PORT is serving '$GOT', not '$WANT'. Something took the port."
+      echo "   Stopping -- the maps already played are fine, this one would measure the wrong net."
+      kill $SC 2>/dev/null
+      exit 1
+    fi
+  fi
   echo "===== $MAP $(date +%H:%M:%S) ====="
   RW_TOURNEY_ID="$TAG-$MAP" RW_MAP="$MAP" RW_TRACE_OUT="$W/data/$TAG-tr-$MAP.jsonl" \
     tools/warrior-tournament.sh "$MATCHES" "http://127.0.0.1:$PORT" 2>&1 \
