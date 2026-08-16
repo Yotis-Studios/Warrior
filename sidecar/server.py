@@ -64,6 +64,19 @@ class Sidecar:
             "model": (self.policy.loaded_model() if hasattr(self.policy, "loaded_model")
                       else getattr(self.policy, "model", None)),
             "capabilities": caps,
+            # WHICH CHECKPOINT IS ACTUALLY PLAYING, and its pid, so a caller can prove it is
+            # talking to the process it just started rather than one that outlived its run.
+            #
+            # It cost a whole arm of a sweep to learn that it cannot. HTTPServer sets
+            # SO_REUSEADDR, so on Windows a second sidecar BINDS 8996 while the first still owns
+            # it, prints its startup banner, and receives nothing; the old process keeps answering
+            # with the old checkpoint. The second arm of the sweep came back byte-identical to the
+            # first -- same wins, same stars, same kills, match for match -- which is the only
+            # reason it was caught at all. `policy` and `model` were both already correct and
+            # identical for both, so health could not tell them apart.
+            "expert": getattr(getattr(self.policy, "expert", None), "name", None),
+            "expert_sha": getattr(getattr(self.policy, "expert", None), "sha", None),
+            "pid": os.getpid(),
             "stats": {"acts": self.total_acts, "errors": self.total_errors,
                       "matches": len(self.matches)},
         }

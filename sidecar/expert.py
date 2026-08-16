@@ -101,7 +101,16 @@ class Expert:
                      "cover": wants_cover,
                      "params": int(sum(v.numel() for v in sd.values()))}
         self.device = torch.device(device)
-        self.name = os.path.basename(checkpoint)
+        # RUN DIRECTORY PLUS FILENAME. Every run writes `last.pt`, so the basename alone names
+        # nothing -- the sidecar log said "expert loaded: last.pt" for all ten of them.
+        self.name = "/".join(os.path.abspath(checkpoint).replace("\\", "/").split("/")[-2:])
+        # A short content hash, so a caller can tell two checkpoints apart without trusting a path.
+        import hashlib
+        h = hashlib.sha256()
+        for k in sorted(sd):
+            h.update(k.encode())
+            h.update(sd[k].detach().cpu().numpy().tobytes())
+        self.sha = h.hexdigest()[:12]
         self.consults = 0
         self.overruled = 0
 

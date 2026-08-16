@@ -57,6 +57,23 @@ if [ -n "$MODEL" ]; then
   ARGS+=(--openrouter "$MODEL")
 fi
 
+# THE PORT MUST BE EMPTY BEFORE WE START, and this is not paranoia -- it silently destroyed an
+# arm of a sweep. HTTPServer sets SO_REUSEADDR, so on Windows a second sidecar binds a port the
+# first still owns, prints a normal startup banner, and then receives nothing: the OLD process goes
+# on answering with the OLD checkpoint. The sweep's second arm came back byte-identical to its
+# first -- same wins, same stars, same kills, match for match -- and nothing anywhere errored.
+for _ in $(seq 1 30); do
+  curl -s --max-time 2 "http://127.0.0.1:$PORT/v1/health" >/dev/null 2>&1 || break
+  echo "  waiting for port $PORT to be released..."
+  sleep 2
+done
+if curl -s --max-time 2 "http://127.0.0.1:$PORT/v1/health" >/dev/null 2>&1; then
+  echo "!! something is still serving port $PORT. Refusing to start -- a new sidecar would bind"
+  echo "   it anyway and the OLD one would answer. Kill it first:"
+  curl -s --max-time 2 "http://127.0.0.1:$PORT/v1/health"; echo
+  exit 1
+fi
+
 python sidecar/server.py "${ARGS[@]}" > "$W/data/$TAG-sc.log" 2>&1 &
 SC=$!
 # The sidecar loads torch and a checkpoint before it binds. Poll rather than sleep a guessed
@@ -65,6 +82,23 @@ for _ in $(seq 1 60); do
   curl -s --max-time 2 "http://127.0.0.1:$PORT/v1/health" >/dev/null 2>&1 && break
   sleep 1
 done
+
+# AND THE THING ANSWERING MUST BE SERVING OUR CHECKPOINT. Every run writes `last.pt`, so the
+# sidecar's own log line ("expert loaded: last.pt") named nothing; health now reports the run
+# directory too. Checked rather than assumed, because the failure mode this catches produces a
+# complete, plausible, entirely wrong results table.
+if [ "$POLICY" = "hybrid" ]; then
+  WANT="$(basename "$(dirname "$EXPERT")")/$(basename "$EXPERT")"
+  GOT=$(curl -s --max-time 5 "http://127.0.0.1:$PORT/v1/health" \
+        | sed -n 's/.*"expert": *"\([^"]*\)".*/\1/p')
+  if [ "$GOT" != "$WANT" ]; then
+    echo "!! sidecar on $PORT is serving '$GOT', not '$WANT'. Aborting."
+    tail -5 "$W/data/$TAG-sc.log"
+    kill $SC 2>/dev/null
+    exit 1
+  fi
+  echo "  sidecar serving $GOT"
+fi
 
 cd "$RW"
 SCRATCH=${LOCALAPPDATA:-$HOME}/Temp/raifuwars-compile
@@ -89,5 +123,28 @@ for MAP in $MAPS; do
     tools/warrior-tournament.sh "$MATCHES" "http://127.0.0.1:$PORT" 2>&1 \
     | tee "$W/data/$TAG-$MAP.log" | grep -a --line-buffered "match \|chance for"
 done
+
+# STOP IT, AND WAIT UNTIL IT HAS ACTUALLY STOPPED ANSWERING. `kill` returns immediately and the
+# sidecar keeps a thread per open connection, so returning here while it still holds the port is
+# what let the next arm bind alongside it. Escalate to the Windows pid, because $! is an MSYS pid
+# and taskkill does not speak that; the sidecar prints its own os.getpid() to health.
+WPID=$(curl -s --max-time 2 "http://127.0.0.1:$PORT/v1/health" \
+       | sed -n 's/.*"pid": *\([0-9]*\).*/\1/p')
 kill $SC 2>/dev/null
+for _ in $(seq 1 15); do
+  curl -s --max-time 2 "http://127.0.0.1:$PORT/v1/health" >/dev/null 2>&1 || break
+  sleep 1
+done
+if curl -s --max-time 2 "http://127.0.0.1:$PORT/v1/health" >/dev/null 2>&1; then
+  echo "  sidecar ignored kill; taskkill //PID $WPID"
+  [ -n "$WPID" ] && taskkill //F //PID "$WPID" >/dev/null 2>&1
+  for _ in $(seq 1 10); do
+    curl -s --max-time 2 "http://127.0.0.1:$PORT/v1/health" >/dev/null 2>&1 || break
+    sleep 1
+  done
+fi
+if curl -s --max-time 2 "http://127.0.0.1:$PORT/v1/health" >/dev/null 2>&1; then
+  echo "!! port $PORT is STILL served after kill and taskkill. Later arms would measure this one."
+  exit 1
+fi
 echo "SEAT RUN DONE $(date +%H:%M:%S)"
