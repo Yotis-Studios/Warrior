@@ -42,19 +42,64 @@ class Expert:
 
         try:
             import torch
-            from raifuwars_rl.features import encode_actions, encode_state
+        except ImportError as exc:                                   # noqa: BLE001
+            raise ExpertUnavailable("could not import torch: %s" % exc) from exc
+
+        # READ THE CHECKPOINT BEFORE IMPORTING THE ENCODER, because the encoder's width is fixed
+        # at import time by RW_FEAT_COVER and cannot be changed afterwards.
+        #
+        # The runs are not one architecture. `ppo-bignet` is 256/128 rather than 128/64, and
+        # `ppo-cover` was trained with the terrain features switched on, which widens the input
+        # from 33/27 to 35/28. The old code called `ActionScorer()` with its defaults and would
+        # have thrown a shape error on both -- the good case. The bad case is the one that
+        # motivates reading the file first: run `ppo-cover` with RW_FEAT_COVER already set for
+        # some other reason and every checkpoint of the OTHER shape loads a 35-wide encoder into
+        # a 33-wide net. So the file decides, and nothing about the environment gets a vote.
+        blob = torch.load(checkpoint, map_location=device, weights_only=False)
+        sd = blob["model"] if isinstance(blob, dict) and "model" in blob else blob
+        try:
+            d_state = sd["state_tower.0.weight"].shape[1]
+            d_action = sd["action_tower.0.weight"].shape[1]
+            hidden = sd["state_tower.0.weight"].shape[0]
+            embed = sd["state_tower.2.weight"].shape[0]
+        except (KeyError, AttributeError, IndexError) as exc:        # noqa: BLE001
+            raise ExpertUnavailable(
+                "%s does not look like an ActionScorer checkpoint: %s" % (checkpoint, exc)) from exc
+
+        wants_cover = d_state > 33
+        os.environ["RW_FEAT_COVER"] = "1" if wants_cover else "0"
+
+        try:
+            from raifuwars_rl.features import D_ACTION, D_STATE, encode_actions, encode_state
             from raifuwars_rl.policy import ActionScorer
         except ImportError as exc:                                   # noqa: BLE001
             raise ExpertUnavailable("could not import the RL policy: %s" % exc) from exc
+
+        # THE ENCODER IS ALREADY IMPORTED SOMEWHERE ELSE case. Setting the env var above is only
+        # effective if `features` had not been imported yet; if it had, the dims are already
+        # frozen and may not be the ones this checkpoint wants. Fail loudly rather than serve a
+        # policy reading garbage -- a mis-scaled feature vector produces confident nonsense, and
+        # a seat that plays badly for an invisible reason is the exact failure this project keeps
+        # paying for.
+        if (D_STATE, D_ACTION) != (d_state, d_action):
+            raise ExpertUnavailable(
+                "%s wants %d/%d features but the encoder is built for %d/%d. It was trained with "
+                "terrain features %s; set RW_FEAT_COVER=%s before starting the sidecar, and do "
+                "not load two checkpoints of different widths in one process."
+                % (checkpoint, d_state, d_action, D_STATE, D_ACTION,
+                   "ON" if wants_cover else "OFF", "1" if wants_cover else "0"))
 
         self._torch = torch
         self._encode_state = encode_state
         self._encode_actions = encode_actions
 
-        blob = torch.load(checkpoint, map_location=device, weights_only=False)
-        self.net = ActionScorer().to(device)
-        self.net.load_state_dict(blob["model"] if "model" in blob else blob)
+        self.net = ActionScorer(d_state=d_state, d_action=d_action,
+                                hidden=hidden, embed=embed).to(device)
+        self.net.load_state_dict(sd)                                 # strict: no silent partials
         self.net.eval()
+        self.arch = {"d_state": d_state, "d_action": d_action, "hidden": hidden, "embed": embed,
+                     "cover": wants_cover,
+                     "params": int(sum(v.numel() for v in sd.values()))}
         self.device = torch.device(device)
         self.name = os.path.basename(checkpoint)
         self.consults = 0

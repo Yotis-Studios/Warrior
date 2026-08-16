@@ -174,6 +174,16 @@ def suite_policy():
           "rules belong in state.briefing, written by the game")
 
 
+def _ckpt_width(torch, path):
+    """The state-feature width a checkpoint was trained at, read from its first layer."""
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    sd = blob["model"] if isinstance(blob, dict) and "model" in blob else blob
+    try:
+        return int(sd["state_tower.0.weight"].shape[1])
+    except Exception:                                                # noqa: BLE001
+        return -1
+
+
 def suite_expert():
     import glob
     ck = sorted(glob.glob(os.path.join(ROOT, "..", "raifuwars-rl", "runs", "*", "last.pt")))
@@ -194,9 +204,56 @@ def suite_expert():
     blob = torch.load(ck[0], map_location="cpu")
     check("expert_checkpoint_has_model_key", isinstance(blob, dict) and "model" in blob,
           str(list(blob)[:3]) if isinstance(blob, dict) else type(blob).__name__)
-    net = ActionScorer()
-    net.load_state_dict(blob["model"])
-    check("expert_loads_at_default_dims", True, "D_STATE=%d D_ACTION=%d" % (D_STATE, D_ACTION))
+
+    # EVERY CHECKPOINT ON DISK MUST LOAD THROUGH THE REAL LOADER, one subprocess each.
+    #
+    # This check used to build an `ActionScorer()` at its defaults and load one arbitrary
+    # checkpoint into it -- a path the sidecar does not use, asserting a fact that was not true.
+    # It went green for as long as every run had the same shape, then crashed the whole suite the
+    # day a 256-wide run appeared. Neither behaviour is a test.
+    #
+    # A subprocess per checkpoint because the feature width is frozen at the first import of
+    # `raifuwars_rl.features`: a run trained with terrain features on is 35/28 and cannot be
+    # verified in a process that has already imported the 33/27 encoder. One process, one
+    # checkpoint, which is also how the sidecar runs.
+    import json
+    import subprocess
+    probe = (
+        "import json,sys;sys.path.insert(0,%r);from expert import Expert;"
+        "print(json.dumps(Expert(sys.argv[1]).arch))" % os.path.join(ROOT, "sidecar"))
+    for path in ck:
+        run = os.path.basename(os.path.dirname(path))
+        p = subprocess.run([sys.executable, "-c", probe, path],
+                           capture_output=True, text=True, timeout=180)
+        tail = (p.stdout.strip().splitlines() or [""])[-1]
+        try:
+            arch = json.loads(tail)
+        except ValueError:
+            arch = None
+        check("expert_loads_%s" % run, arch is not None,
+              "%dw %d/%d params=%d%s" % (arch["hidden"], arch["d_state"], arch["d_action"],
+                                         arch["params"], " cover" if arch["cover"] else "")
+              if arch else (p.stderr.strip().splitlines() or ["no output"])[-1][:120])
+
+    # A CHECKPOINT WHOSE WIDTH THE ENCODER CANNOT SERVE MUST SAY SO. This process has already
+    # imported the encoder at D_STATE, so a checkpoint of any other width is unservable here --
+    # and the required behaviour is a named refusal, not confident nonsense from a net fed a
+    # feature vector of the wrong shape.
+    other = next((p for p in ck if _ckpt_width(torch, p) != D_STATE), None)
+    if other is None:
+        check("expert_refuses_mismatched_feature_width", True, "(no checkpoint of another width)")
+    else:
+        try:
+            from expert import Expert, ExpertUnavailable
+            Expert(other)
+            check("expert_refuses_mismatched_feature_width", False, "loaded a %d-wide net anyway"
+                  % _ckpt_width(torch, other))
+        except ExpertUnavailable as exc:
+            check("expert_refuses_mismatched_feature_width", "RW_FEAT_COVER" in str(exc),
+                  os.path.basename(os.path.dirname(other)))
+        except Exception as exc:                                     # noqa: BLE001
+            check("expert_refuses_mismatched_feature_width", False,
+                  "raised %s, not ExpertUnavailable" % type(exc).__name__)
 
     # NO CONSTANT FEATURES. A feature identical across every offered action carries no information
     # and is a bias term that costs a weight -- exactly what dest_exposure turned out to be.
