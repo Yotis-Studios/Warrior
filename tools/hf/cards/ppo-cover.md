@@ -131,9 +131,11 @@ COMMON
 - **The three terrain features are dead weights.** They are shipped so the checkpoint loads at the
   width it was trained at; they carry no information. Do not cite this model as evidence that
   terrain features help or do not help.
-- **It requires `RW_FEAT_COVER=1`** to load at all, and `serve.py` will refuse and say so
-  otherwise. In a process where the flag is *wrong*, a checkpoint of the other width would load
-  cleanly and read the wrong numbers — which is why the check exists.
+- **It requires `RW_FEAT_COVER=1`**, and `serve.py` refuses at startup and says so otherwise. Note
+  what the check buys: the weights themselves load fine under the wrong flag, and the mismatch only
+  appears on the first decision as a matrix shape error. A host that catches policy errors and
+  falls back to a legal action will play the whole match on fallbacks and still hand you a results
+  table, so the failure is cheap to miss without the startup check.
 - Trained against a **scripted greedy opponent only**, so like its sibling `ppo-sim` it is expected
   to lose badly to self-play policies while scoring well against scripted ones. In head-to-head it
   is untested; it cannot share an arena process with the 33/27 runs.

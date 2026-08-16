@@ -24,8 +24,11 @@ RW_FEAT_COVER=COVERFLAG python serve.py WEIGHTS --port 8901
 
 `serve.py` reads the architecture out of the checkpoint's own first layer rather than assuming
 one, so it loads any of the published ActionScorer variants. The one thing it cannot infer is the
-**feature width**, which is fixed at import time by `RW_FEAT_COVER`: set it wrong and the network
-loads cleanly and reads the wrong numbers. It checks, and exits naming the flag to set.
+**feature width**, which is fixed at import time by `RW_FEAT_COVER`. Set it wrong and the weights
+load without complaint — the mismatch only surfaces on the first decision, as a matrix shape error
+one layer deep. A sidecar that catches policy errors and falls back to a legal action will then
+play a whole match on fallbacks and still produce a results table. So it is checked at startup
+instead, and exits naming the flag to set.
 
 ## Reading the numbers on this page
 

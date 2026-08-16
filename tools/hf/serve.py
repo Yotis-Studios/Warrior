@@ -155,11 +155,13 @@ class Policy:
         hidden = sd["state_tower.0.weight"].shape[0]
         embed = sd["state_tower.2.weight"].shape[0]
 
-        # THE FEATURE WIDTH IS THE ONE THAT FAILS QUIETLY. A wrong hidden size raises on every
-        # layer, which is fine -- you find out. A checkpoint trained with RW_FEAT_COVER=1 loaded
-        # in a process that encodes 33/27 has the right parameter count for its towers and simply
-        # reads the wrong numbers, which produces a confident policy that plays badly for a reason
-        # nothing reports. So it is checked, and named in the message.
+        # THE FEATURE WIDTH IS CHECKED BECAUSE IT FAILS LATE. A wrong hidden size raises here, at
+        # load, which is fine -- you find out immediately. A wrong RW_FEAT_COVER does not: the
+        # towers are built from the checkpoint, so load_state_dict succeeds, and the mismatch first
+        # appears one layer into the first decision as "mat1 and mat2 shapes cannot be multiplied".
+        # A host that catches policy errors and falls back to a legal action -- which the reference
+        # sidecar does, by design, so a crash cannot hang a game -- will then play an entire match
+        # on fallbacks and still produce a results table. Checked at startup, and named.
         if (d_state, d_action) != (D_STATE, D_ACTION):
             raise SystemExit(
                 "%s was trained on %d/%d features but this process encodes %d/%d.\n"
